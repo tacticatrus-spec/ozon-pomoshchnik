@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -19,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 
 app = Flask(__name__)
@@ -272,15 +273,17 @@ def attribute_replacements(search_text, replacement_text):
         for group_name in ("attributes", "complex_attributes"):
             for attribute in product.get(group_name) or []:
                 values = attribute.get("values") or []
-                if not any(str(v.get("value") or "").strip().casefold() == needle for v in values):
+                if not any(needle in str(v.get("value") or "").casefold() for v in values):
                     continue
                 new_values = []
                 for value in values:
                     old_value = str(value.get("value") or "")
-                    changed = old_value.strip().casefold() == needle
+                    changed = needle in old_value.casefold()
+                    new_value = re.sub(re.escape(search_text.strip()), replacement_text, old_value,
+                                       flags=re.IGNORECASE) if changed else old_value
                     new_values.append({
                         "dictionary_value_id": int(value.get("dictionary_value_id") or 0),
-                        "value": replacement_text if changed else old_value,
+                        "value": new_value,
                     })
                     if changed:
                         preview.append({
@@ -290,7 +293,7 @@ def attribute_replacements(search_text, replacement_text):
                             "attribute_id": attribute.get("id"),
                             "complex_id": int(attribute.get("complex_id") or 0),
                             "old_value": old_value,
-                            "new_value": replacement_text,
+                            "new_value": new_value,
                             "dictionary_value_id": int(value.get("dictionary_value_id") or 0),
                         })
                 product_updates.append({
