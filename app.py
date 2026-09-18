@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 
 app = Flask(__name__)
@@ -267,13 +267,21 @@ def attribute_replacements(search_text, replacement_text):
     if not needle or not replacement_text:
         raise ValueError("Заполните текст для поиска и замены")
 
-    preview, update_items = [], []
+    preview, update_items, skipped_videos = [], [], 0
     for product in Ozon().product_attributes():
         product_updates = []
         for group_name in ("attributes", "complex_attributes"):
             for attribute in product.get(group_name) or []:
                 values = attribute.get("values") or []
                 if not any(needle in str(v.get("value") or "").casefold() for v in values):
+                    continue
+                # Ozon exposes uploaded video file names as a service complex
+                # attribute. They cannot be renamed by the partial attributes API.
+                if int(attribute.get("id") or 0) == 21837 and int(attribute.get("complex_id") or 0) == 100001:
+                    skipped_videos += sum(
+                        1 for value in values
+                        if needle in str(value.get("value") or "").casefold()
+                    )
                     continue
                 new_values = []
                 for value in values:
@@ -303,7 +311,7 @@ def attribute_replacements(search_text, replacement_text):
                 })
         if product_updates:
             update_items.append({"offer_id": product.get("offer_id", ""), "attributes": product_updates})
-    return preview, update_items
+    return preview, update_items, skipped_videos
 
 
 def sync_orders():
@@ -456,8 +464,8 @@ def demo(): demo_data(); return jsonify(ok=True)
 def attributes_find():
     x = request.json or {}
     try:
-        matches, _ = attribute_replacements(x.get("search", ""), x.get("replacement", ""))
-        return jsonify(ok=True, matches=matches, count=len(matches))
+        matches, _, skipped_videos = attribute_replacements(x.get("search", ""), x.get("replacement", ""))
+        return jsonify(ok=True, matches=matches, count=len(matches), skipped_videos=skipped_videos)
     except Exception as e:
         return jsonify(ok=False, message=str(e)), 400
 
@@ -470,16 +478,22 @@ def attributes_replace():
     search_text = str(x.get("search", "")).strip()
     replacement_text = str(x.get("replacement", "")).strip()
     try:
-        matches, items = attribute_replacements(search_text, replacement_text)
+        matches, items, skipped_videos = attribute_replacements(search_text, replacement_text)
         if not matches:
-            return jsonify(ok=True, count=0, task_ids=[], message="Совпадений уже нет — изменять нечего")
+            message = "Совпадений в изменяемых характеристиках нет"
+            if skipped_videos:
+                message += f"; пропущено названий видео: {skipped_videos}"
+            return jsonify(ok=True, count=0, task_ids=[], skipped_videos=skipped_videos, message=message)
         if any(not item.get("offer_id") for item in items):
             raise OzonError("У одного из товаров отсутствует артикул; замена остановлена")
         task_ids = Ozon().update_attributes(items)
         log(f"Характеристики: отправлена замена «{search_text}» → «{replacement_text}»; значений: {len(matches)}, товаров: {len(items)}")
         notify(f"Ozon Помощник: отправлена замена «{search_text}» → «{replacement_text}» для {len(items)} товаров")
+        message = f"Замена отправлена в Ozon: {len(matches)} значений в {len(items)} товарах"
+        if skipped_videos:
+            message += f"; названия видео пропущены: {skipped_videos}"
         return jsonify(ok=True, count=len(matches), products=len(items), task_ids=task_ids,
-                       message=f"Замена отправлена в Ozon: {len(matches)} значений в {len(items)} товарах")
+                       skipped_videos=skipped_videos, message=message)
     except Exception as e:
         log(f"Ошибка замены характеристик: {e}", "error")
         return jsonify(ok=False, message=str(e)), 400
