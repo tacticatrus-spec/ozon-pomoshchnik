@@ -19,7 +19,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 
 app = Flask(__name__)
@@ -141,6 +141,35 @@ class Ozon:
             result.extend(data.get("result", {}).get("items", data.get("items", [])))
         return result
 
+    def product_attributes(self):
+        """Return every product card with its ordinary and complex attributes."""
+        result, last_id = [], ""
+        while True:
+            data = self.call("/v4/product/info/attributes", {
+                "filter": {"visibility": "ALL"},
+                "last_id": last_id,
+                "limit": 1000,
+                "sort_dir": "ASC",
+            })
+            items = data.get("result", data.get("items", []))
+            if isinstance(items, dict):
+                items = items.get("items", [])
+            result.extend(items)
+            next_id = data.get("last_id", "")
+            if not items or not next_id or next_id == last_id or len(items) < 1000:
+                return result
+            last_id = next_id
+
+    def update_attributes(self, items):
+        """Partially update only the supplied attributes; other card fields stay intact."""
+        task_ids = []
+        for i in range(0, len(items), 100):
+            data = self.call("/v1/product/attributes/update", {"items": items[i:i+100]})
+            task_id = data.get("task_id") or data.get("result", {}).get("task_id")
+            if task_id:
+                task_ids.append(task_id)
+        return task_ids
+
     def stocks(self):
         data = self.call("/v4/product/info/stocks", {"filter": {"visibility": "ALL"}, "limit": 1000, "cursor": ""})
         return data.get("items", data.get("result", {}).get("items", []))
@@ -228,6 +257,50 @@ def sync_products():
     log(f"Синхронизировано товаров: {len(prices)}")
     notify(f"Ozon Помощник: синхронизировано товаров — {len(prices)}")
     return len(prices)
+
+
+def attribute_replacements(search_text, replacement_text):
+    """Build a preview and a partial-update payload for exact attribute values."""
+    needle = search_text.strip().casefold()
+    replacement_text = replacement_text.strip()
+    if not needle or not replacement_text:
+        raise ValueError("Заполните текст для поиска и замены")
+
+    preview, update_items = [], []
+    for product in Ozon().product_attributes():
+        product_updates = []
+        for group_name in ("attributes", "complex_attributes"):
+            for attribute in product.get(group_name) or []:
+                values = attribute.get("values") or []
+                if not any(str(v.get("value") or "").strip().casefold() == needle for v in values):
+                    continue
+                new_values = []
+                for value in values:
+                    old_value = str(value.get("value") or "")
+                    changed = old_value.strip().casefold() == needle
+                    new_values.append({
+                        "dictionary_value_id": int(value.get("dictionary_value_id") or 0),
+                        "value": replacement_text if changed else old_value,
+                    })
+                    if changed:
+                        preview.append({
+                            "product_id": product.get("id"),
+                            "offer_id": product.get("offer_id", ""),
+                            "name": product.get("name") or f"Товар {product.get('id', '')}",
+                            "attribute_id": attribute.get("id"),
+                            "complex_id": int(attribute.get("complex_id") or 0),
+                            "old_value": old_value,
+                            "new_value": replacement_text,
+                            "dictionary_value_id": int(value.get("dictionary_value_id") or 0),
+                        })
+                product_updates.append({
+                    "id": int(attribute.get("id")),
+                    "complex_id": int(attribute.get("complex_id") or 0),
+                    "values": new_values,
+                })
+        if product_updates:
+            update_items.append({"offer_id": product.get("offer_id", ""), "attributes": product_updates})
+    return preview, update_items
 
 
 def sync_orders():
@@ -374,6 +447,39 @@ def sync():
 
 @app.post("/api/demo")
 def demo(): demo_data(); return jsonify(ok=True)
+
+
+@app.post("/api/attributes/find")
+def attributes_find():
+    x = request.json or {}
+    try:
+        matches, _ = attribute_replacements(x.get("search", ""), x.get("replacement", ""))
+        return jsonify(ok=True, matches=matches, count=len(matches))
+    except Exception as e:
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.post("/api/attributes/replace")
+def attributes_replace():
+    x = request.json or {}
+    if x.get("confirmed") is not True:
+        return jsonify(ok=False, message="Нужно подтвердить замену"), 400
+    search_text = str(x.get("search", "")).strip()
+    replacement_text = str(x.get("replacement", "")).strip()
+    try:
+        matches, items = attribute_replacements(search_text, replacement_text)
+        if not matches:
+            return jsonify(ok=True, count=0, task_ids=[], message="Совпадений уже нет — изменять нечего")
+        if any(not item.get("offer_id") for item in items):
+            raise OzonError("У одного из товаров отсутствует артикул; замена остановлена")
+        task_ids = Ozon().update_attributes(items)
+        log(f"Характеристики: отправлена замена «{search_text}» → «{replacement_text}»; значений: {len(matches)}, товаров: {len(items)}")
+        notify(f"Ozon Помощник: отправлена замена «{search_text}» → «{replacement_text}» для {len(items)} товаров")
+        return jsonify(ok=True, count=len(matches), products=len(items), task_ids=task_ids,
+                       message=f"Замена отправлена в Ozon: {len(matches)} значений в {len(items)} товарах")
+    except Exception as e:
+        log(f"Ошибка замены характеристик: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
 
 
 @app.post("/api/product/<int:pid>/cost")
