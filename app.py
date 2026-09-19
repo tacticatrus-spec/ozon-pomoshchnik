@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 
 app = Flask(__name__)
@@ -360,7 +360,7 @@ def sync_messages():
 
 
 @app.get("/")
-def home(): return render_template("index.html")
+def home(): return render_template("index.html", version=VERSION)
 
 
 @app.get("/api/dashboard")
