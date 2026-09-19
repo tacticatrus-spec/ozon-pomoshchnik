@@ -25,7 +25,8 @@ async function findAttributes(){
   $('replaceAttributesButton').style.display='none';
   let x=await api('/api/attributes/find',{method:'POST',body:JSON.stringify({search,replacement})});
   attributeMatches=x.matches||[];
-  let skipped=x.skipped_videos?`<p class="hint">Названия видео .mp4 пропущены: ${x.skipped_videos}. Ozon не разрешает переименовывать уже загруженные ролики через API.</p>`:'';
+  let skippedItems=x.skipped_video_items||[];
+  let skipped=skippedItems.length?`<p><b>Видео, которые нужно переименовать вручную: ${skippedItems.length}</b></p><div class="tablewrap"><table><thead><tr><th>Товар</th><th>Артикул</th><th>Старое имя видео</th></tr></thead><tbody>${skippedItems.map(m=>`<tr><td>${esc(m.name)}</td><td><b>${esc(m.offer_id)}</b></td><td>${esc(m.file_name)}</td></tr>`).join('')}</tbody></table></div><p class="hint">Ozon не разрешает переименовывать уже загруженные ролики через API. Откройте товар по артикулу, удалите старое видео и загрузите файл с новым именем.</p>`:'';
   $('attributeMatches').innerHTML=(attributeMatches.length?`<p><b>Можно изменить значений: ${attributeMatches.length}</b></p><div class="tablewrap"><table><thead><tr><th>Товар</th><th>Артикул</th><th>Характеристика</th><th>Замена</th></tr></thead><tbody>${attributeMatches.map(m=>`<tr><td>${esc(m.name)}</td><td>${esc(m.offer_id)}</td><td>ID ${m.attribute_id}${m.complex_id?' / блок '+m.complex_id:''}</td><td>${esc(m.old_value)} → <b>${esc(m.new_value)}</b></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">Совпадений в изменяемых характеристиках нет.</p>')+skipped;
   $('replaceAttributesButton').style.display=attributeMatches.length?'inline-block':'none';
   toast(attributeMatches.length?`Найдено: ${attributeMatches.length}`:'Совпадений нет');
