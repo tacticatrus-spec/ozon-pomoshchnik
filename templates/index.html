@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ozon Помощник</title><link rel="stylesheet" href="/static/style.css"></head>
+<title>Ozon Помощник</title><link rel="stylesheet" href="/static/style.css?v={{ version }}"></head>
 <body><aside><div class="brand"><b>OZON</b><span>ПОМОЩНИК</span></div>
 <nav><button class="active" data-tab="overview">Обзор</button><button data-tab="products">Товары и цены</button><button data-tab="orders">Заказы</button><button data-tab="messages">Отзывы и вопросы</button><button data-tab="settings">Настройки</button></nav>
 </aside><main><header><div><h1 id="title">Обзор</h1><p id="status">Локальная программа • данные остаются на компьютере</p></div><button class="primary" onclick="syncAll()">↻ Синхронизировать</button></header>
@@ -9,4 +9,4 @@
 <section id="orders" class="tab"><div class="panel"><h2>Последние заказы</h2><div class="tablewrap"><table><thead><tr><th>Номер</th><th>Схема</th><th>Статус</th><th>Дата</th><th>Сумма</th></tr></thead><tbody id="ordersBody"></tbody></table></div></div></section>
 <section id="messages" class="tab"><div class="panel"><h2>Отзывы и вопросы</h2><div id="messagesList"></div></div></section>
 <section id="settings" class="tab"><div class="panel form"><h2>Подключение Ozon Seller API</h2><label>Client ID<input id="clientId" placeholder="Например: 123456"></label><label>API Key<input id="apiKey" type="password" placeholder="Ключ не показывается после сохранения"></label><div class="row"><button class="primary" onclick="saveSettings()">Сохранить</button><button onclick="testOzon()">Проверить подключение</button></div></div><div class="panel form"><h2>Telegram</h2><label>Токен бота<input id="tgToken" type="password" placeholder="Получите у @BotFather"></label><label>Chat ID<input id="chatId" placeholder="Можно определить автоматически"></label><div class="row"><button class="primary" onclick="saveSettings()">Сохранить</button><button onclick="findChat()">Определить Chat ID</button></div></div><div class="panel form"><h2>Обновления</h2><p id="appVersion" class="hint">Версия</p><p id="updateStatus">Проверка обновлений…</p><p id="updateNotes" class="hint"></p><div class="row"><button onclick="checkUpdate()">Проверить обновления</button><button id="installUpdate" class="primary" onclick="installUpdate()" style="display:none">Установить обновление</button></div></div><div class="panel"><h2>Проверка интерфейса</h2><button onclick="demo()">Загрузить демонстрационные товары</button></div></section>
-<div id="toast"></div></main><script src="/static/app.js"></script></body></html>
+<div id="toast"></div></main><script src="/static/app.js?v={{ version }}"></script></body></html>
