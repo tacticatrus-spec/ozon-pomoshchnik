@@ -16,6 +16,20 @@ async function testOzon(){try{toast((await api('/api/test',{method:'POST'})).mes
 async function findChat(){try{let x=await api('/api/telegram/chat');$('chatId').value=x.chat_id;toast('Telegram подключён')}catch(e){toast(e.message,true)}}
 async function syncAll(){try{toast('Синхронизация началась…');let x=await api('/api/sync',{method:'POST'});toast(x.message);await load()}catch(e){toast(e.message,true)}}
 async function demo(){await api('/api/demo',{method:'POST'});toast('Демо-данные загружены');load()}
+async function exportCards(){
+ const prefix=$('exportPrefix').value.trim();
+ if(!prefix){toast('Укажите начало артикула',true);return}
+ try{
+  toast('Собираю полные данные карточек…');
+  let r=await fetch('/api/products/export?prefix='+encodeURIComponent(prefix));
+  if(!r.ok){let j=await r.json();throw Error(j.message||'Ошибка выгрузки')}
+  let blob=await r.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');
+  let disposition=r.headers.get('Content-Disposition')||'';
+  let match=disposition.match(/filename="([^"]+)"/);
+  a.href=url;a.download=match?match[1]:'ozon_cards.json';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+  toast('Файл карточек скачан');
+ }catch(e){toast(e.message,true)}
+}
 let attributeMatches=[];
 async function findAttributes(){
  const search=$('attrSearch').value.trim(),replacement=$('attrReplacement').value.trim();
