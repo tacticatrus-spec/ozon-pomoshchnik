@@ -20,9 +20,10 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
+TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
 
 app = Flask(__name__)
 
@@ -478,7 +479,15 @@ def attributes_find():
 
 def tt_optimization_data():
     if not TT_OPTIMIZATION_PATH.exists():
-        raise RuntimeError("Файл улучшений TT не найден")
+        try:
+            response = requests.get(TT_OPTIMIZATION_URL, params={"t": int(datetime.now().timestamp())}, timeout=20)
+            response.raise_for_status()
+            package = response.json()
+            if not isinstance(package.get("items"), list) or not package["items"]:
+                raise RuntimeError("получен пустой список улучшений")
+            TT_OPTIMIZATION_PATH.write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception as e:
+            raise RuntimeError(f"Не удалось скачать файл улучшений TT: {e}") from e
     return json.loads(TT_OPTIMIZATION_PATH.read_text(encoding="utf-8"))
 
 
