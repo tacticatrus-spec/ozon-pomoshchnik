@@ -13,14 +13,14 @@ from pathlib import Path
 import keyring
 from keyring.errors import KeyringError
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, make_response, render_template, request
 from waitress import serve
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 
 app = Flask(__name__)
@@ -476,6 +476,75 @@ def attributes_find():
         return jsonify(ok=True, matches=matches, count=len(matches),
                        skipped_videos=len(skipped_videos), skipped_video_items=skipped_videos)
     except Exception as e:
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.get("/api/products/export")
+def products_export():
+    """Download complete Seller API data for cards whose offer_id has a prefix."""
+    prefix = str(request.args.get("prefix", "TT-")).strip()
+    if not prefix:
+        return jsonify(ok=False, message="Укажите начало артикула, например TT-"), 400
+    try:
+        api = Ozon()
+        cards = [
+            item for item in api.product_attributes()
+            if str(item.get("offer_id") or "").casefold().startswith(prefix.casefold())
+        ]
+        product_ids = [int(item.get("id")) for item in cards if item.get("id")]
+        info_by_id = {}
+        info_error = ""
+        if product_ids:
+            try:
+                info_by_id = {
+                    int(item.get("id") or item.get("product_id")): item
+                    for item in api.product_info(product_ids)
+                    if item.get("id") or item.get("product_id")
+                }
+            except Exception as e:
+                # Attributes are still valuable if the supplementary endpoint is
+                # temporarily unavailable or has changed permissions.
+                info_error = str(e)
+
+        with db() as c:
+            local_by_offer = {
+                row["offer_id"]: dict(row)
+                for row in c.execute(
+                    "SELECT * FROM products WHERE lower(offer_id) LIKE lower(?) ORDER BY offer_id",
+                    (prefix + "%",),
+                )
+            }
+
+        items = []
+        for card in sorted(cards, key=lambda x: str(x.get("offer_id") or "")):
+            product_id = int(card.get("id") or 0)
+            offer_id = str(card.get("offer_id") or "")
+            items.append({
+                "product_id": product_id,
+                "offer_id": offer_id,
+                "name": card.get("name") or local_by_offer.get(offer_id, {}).get("name", ""),
+                "local": local_by_offer.get(offer_id, {}),
+                "card": card,
+                "product_info": info_by_id.get(product_id, {}),
+            })
+
+        payload = {
+            "format": "ozon-assistant-card-export-v1",
+            "app_version": VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "offer_id_prefix": prefix,
+            "count": len(items),
+            "supplementary_info_error": info_error,
+            "items": items,
+        }
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", prefix).strip("_") or "products"
+        response = make_response(json.dumps(payload, ensure_ascii=False, indent=2))
+        response.headers["Content-Type"] = "application/json; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="ozon_cards_{safe_prefix}.json"'
+        log(f"Выгружены карточки с артикулами {prefix}: {len(items)}")
+        return response
+    except Exception as e:
+        log(f"Ошибка выгрузки карточек {prefix}: {e}", "error")
         return jsonify(ok=False, message=str(e)), 400
 
 
