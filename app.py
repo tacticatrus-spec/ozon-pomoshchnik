@@ -20,8 +20,9 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
+TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 
 app = Flask(__name__)
 
@@ -133,11 +134,7 @@ class Ozon:
     def product_info(self, ids):
         result = []
         for i in range(0, len(ids), 1000):
-            body = {
-                "filter": {"product_id": [str(x) for x in ids[i:i+1000]], "visibility": "ALL"},
-                "last_id": "",
-                "limit": 1000,
-            }
+            body = {"product_id": [str(x) for x in ids[i:i+1000]]}
             data = self.call("/v3/product/info/list", body)
             result.extend(data.get("result", {}).get("items", data.get("items", [])))
         return result
@@ -476,6 +473,76 @@ def attributes_find():
         return jsonify(ok=True, matches=matches, count=len(matches),
                        skipped_videos=len(skipped_videos), skipped_video_items=skipped_videos)
     except Exception as e:
+        return jsonify(ok=False, message=str(e)), 400
+
+
+def tt_optimization_data():
+    if not TT_OPTIMIZATION_PATH.exists():
+        raise RuntimeError("Файл улучшений TT не найден")
+    return json.loads(TT_OPTIMIZATION_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/api/optimization/tt/preview")
+def tt_optimization_preview():
+    try:
+        package = tt_optimization_data()
+        proposed = {item["offer_id"]: item for item in package.get("items", [])}
+        current = {
+            str(item.get("offer_id") or ""): item
+            for item in Ozon().product_attributes()
+            if str(item.get("offer_id") or "") in proposed
+        }
+        preview = []
+        for offer_id, change in proposed.items():
+            card = current.get(offer_id, {})
+            preview.append({
+                "offer_id": offer_id,
+                "found": bool(card),
+                "old_name": card.get("name", "Товар не найден в Ozon"),
+                "new_name": change["new_name"],
+                "description": change["description"],
+                "keywords": change["keywords"],
+            })
+        return jsonify(ok=True, count=len(preview), found=sum(1 for x in preview if x["found"]), items=preview)
+    except Exception as e:
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.post("/api/optimization/tt/apply")
+def tt_optimization_apply():
+    x = request.json or {}
+    if x.get("confirmed") is not True:
+        return jsonify(ok=False, message="Нужно подтвердить отправку улучшений"), 400
+    try:
+        package = tt_optimization_data()
+        current_offers = {
+            str(item.get("offer_id") or "")
+            for item in Ozon().product_attributes()
+        }
+        updates = []
+        skipped = []
+        for item in package.get("items", []):
+            offer_id = item["offer_id"]
+            if offer_id not in current_offers:
+                skipped.append(offer_id)
+                continue
+            updates.append({
+                "offer_id": offer_id,
+                "attributes": [
+                    {"id": 4180, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["new_name"]}]},
+                    {"id": 4191, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["description"]}]},
+                    {"id": 23171, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["keywords"]}]},
+                ],
+            })
+        if not updates:
+            return jsonify(ok=False, message="Карточки TT не найдены"), 404
+        task_ids = Ozon().update_attributes(updates)
+        log(f"Прокачка TT: отправлено товаров {len(updates)}; пропущено {len(skipped)}")
+        notify(f"Ozon Помощник: отправлены улучшения для {len(updates)} карточек TT")
+        return jsonify(ok=True, updated=len(updates), skipped=skipped, task_ids=task_ids,
+                       message=f"Улучшения отправлены в Ozon для {len(updates)} карточек")
+    except Exception as e:
+        log(f"Ошибка прокачки TT: {e}", "error")
         return jsonify(ok=False, message=str(e)), 400
 
 
