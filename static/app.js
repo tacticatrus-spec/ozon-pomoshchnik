@@ -30,6 +30,25 @@ async function exportCards(){
   toast('Файл карточек скачан');
  }catch(e){toast(e.message,true)}
 }
+let ttOptimizationReady=false;
+async function previewTTOptimization(){
+ try{
+  $('ttOptimizationPreview').innerHTML='<p class="hint">Проверяю карточки TT в Ozon…</p>';
+  $('applyTTOptimization').style.display='none';
+  let x=await api('/api/optimization/tt/preview');ttOptimizationReady=x.found>0;
+  $('ttOptimizationPreview').innerHTML=`<p><b>Найдено карточек: ${x.found} из ${x.count}</b></p><div class="tablewrap"><table><thead><tr><th>Артикул</th><th>Сейчас</th><th>Будет</th></tr></thead><tbody>${x.items.map(i=>`<tr><td><b>${esc(i.offer_id)}</b>${i.found?'':'<br><span class="bad">Не найден</span>'}</td><td>${esc(i.old_name)}</td><td><b>${esc(i.new_name)}</b></td></tr>`).join('')}</tbody></table></div><p class="hint">Будут заменены только название, описание и поисковые фразы. Цена, остаток, фотографии и отзывы сохранятся.</p>`;
+  $('applyTTOptimization').style.display=ttOptimizationReady?'inline-block':'none';
+ }catch(e){$('ttOptimizationPreview').innerHTML='';toast(e.message,true)}
+}
+async function applyTTOptimization(){
+ if(!ttOptimizationReady)return;
+ if(!confirm('Отправить в Ozon новые названия, описания и поисковые фразы для найденных карточек TT?'))return;
+ try{
+  $('applyTTOptimization').disabled=true;
+  let x=await api('/api/optimization/tt/apply',{method:'POST',body:JSON.stringify({confirmed:true})});
+  toast(x.message);$('ttOptimizationPreview').innerHTML=`<p class="good">${esc(x.message)}</p><p class="hint">Ozon обработает изменения в очереди. Это может занять несколько минут.</p>`;$('applyTTOptimization').style.display='none';ttOptimizationReady=false;
+ }catch(e){toast(e.message,true)}finally{$('applyTTOptimization').disabled=false}
+}
 let attributeMatches=[];
 async function findAttributes(){
  const search=$('attrSearch').value.trim(),replacement=$('attrReplacement').value.trim();
