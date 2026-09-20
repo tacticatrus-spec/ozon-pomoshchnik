@@ -9,7 +9,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 ARCHIVE_URL = "https://github.com/tacticatrus-spec/ozon-pomoshchnik/archive/refs/heads/main.zip"
-FILES = ("app.py", "requirements.txt", "run.bat", "updater.py", "static", "templates")
+FILES = ("app.py", "requirements.txt", "run.bat", "updater.py", "tt_optimization.json", "static", "templates")
 
 
 def main():
