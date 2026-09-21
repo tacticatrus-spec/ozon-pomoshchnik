@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -72,6 +72,62 @@ def setting(key, default=""):
 def save_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def cost_rules():
+    try:
+        rules = json.loads(setting("cost_rules", "[]"))
+    except (TypeError, ValueError):
+        return []
+    valid = []
+    for rule in rules if isinstance(rules, list) else []:
+        try:
+            prefix = str(rule.get("prefix") or "").strip().upper()
+            cost = float(rule.get("cost"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if prefix and cost >= 0:
+            valid.append({"prefix": prefix, "cost": cost})
+    return valid
+
+
+def cost_for_offer(offer_id, rules=None):
+    offer_id = str(offer_id or "").upper()
+    for rule in sorted(rules if rules is not None else cost_rules(), key=lambda x: len(x["prefix"]), reverse=True):
+        if offer_id.startswith(rule["prefix"]):
+            return rule["cost"]
+    return None
+
+
+def apply_cost_rules(force=False):
+    """Apply locally saved rules without sending cost data to Ozon."""
+    rules = cost_rules()
+    changed = 0
+    with db() as c:
+        rows = c.execute("SELECT product_id, offer_id, cost FROM products").fetchall()
+        for row in rows:
+            cost = cost_for_offer(row["offer_id"], rules)
+            if cost is None or (not force and float(row["cost"] or 0) != 0):
+                continue
+            if float(row["cost"] or 0) != cost:
+                c.execute("UPDATE products SET cost=? WHERE product_id=?", (cost, row["product_id"]))
+                changed += 1
+    return changed
+
+
+def apply_one_cost_rule(prefix, cost, force=True):
+    changed = 0
+    with db() as c:
+        rows = c.execute("SELECT product_id, offer_id, cost FROM products").fetchall()
+        for row in rows:
+            if not str(row["offer_id"] or "").upper().startswith(prefix):
+                continue
+            if not force and float(row["cost"] or 0) != 0:
+                continue
+            if float(row["cost"] or 0) != cost:
+                c.execute("UPDATE products SET cost=? WHERE product_id=?", (cost, row["product_id"]))
+                changed += 1
+    return changed
 
 
 def log(message, level="info"):
@@ -254,7 +310,8 @@ def sync_products():
                d.get("name") or x.get("name") or b.get("name") or f"Товар {pid}",
                d.get("sku") or x.get("sku", 0), current, old, stock_map.get(pid, 0), now))
     log(f"Синхронизировано товаров: {len(prices)}")
-    notify(f"Ozon Помощник: синхронизировано товаров — {len(prices)}")
+    apply_cost_rules(force=False)
+    notify(f"OZON Assistant: синхронизировано товаров — {len(prices)}")
     return len(prices)
 
 
@@ -353,7 +410,7 @@ def sync_messages():
                 txt = x.get("text") or x.get("question_text") or x.get("content", "")
                 c.execute("INSERT OR REPLACE INTO messages VALUES(?,?,?,?,?,?,?)", (mid, kind, x.get("product_id"), txt, x.get("status", "UNPROCESSED"), x.get("published_at") or x.get("created_at", ""), json.dumps(x, ensure_ascii=False)))
                 count += 1
-    if count: notify(f"Ozon Помощник: новых отзывов и вопросов — {count}")
+    if count: notify(f"OZON Assistant: новых отзывов и вопросов — {count}")
     return count
 
 
@@ -374,6 +431,7 @@ def dashboard():
         fee = p["price"] * p["commission_pct"] / 100
         p["profit"] = round(p["price"] - p["cost"] - fee - p["logistics"], 2)
     return jsonify(products=products, orders=orders, order_count=order_count, messages=messages, events=events, proposals=proposals,
+                   cost_rules=cost_rules(),
                    version=VERSION,
                    configured=bool(secret("client_id") and secret("api_key")), telegram=bool(secret("telegram_token") and setting("telegram_chat_id")))
 
@@ -447,7 +505,7 @@ def telegram_chat():
         chat = updates[-1].get("message", {}).get("chat", {}) if updates else {}
         if not chat.get("id"): raise RuntimeError("Сначала отправьте боту любое сообщение")
         save_setting("telegram_chat_id", chat["id"])
-        notify("Ozon Помощник подключён ✅")
+        notify("OZON Assistant подключён ✅")
         return jsonify(ok=True, chat_id=chat["id"])
     except Exception as e: return jsonify(ok=False, message=str(e)), 400
 
@@ -547,7 +605,7 @@ def tt_optimization_apply():
             return jsonify(ok=False, message="Карточки TT не найдены"), 404
         task_ids = Ozon().update_attributes(updates)
         log(f"Прокачка TT: отправлено товаров {len(updates)}; пропущено {len(skipped)}")
-        notify(f"Ozon Помощник: отправлены улучшения для {len(updates)} карточек TT")
+        notify(f"OZON Assistant: отправлены улучшения для {len(updates)} карточек TT")
         return jsonify(ok=True, updated=len(updates), skipped=skipped, task_ids=task_ids,
                        message=f"Улучшения отправлены в Ozon для {len(updates)} карточек")
     except Exception as e:
@@ -643,7 +701,7 @@ def attributes_replace():
             raise OzonError("У одного из товаров отсутствует артикул; замена остановлена")
         task_ids = Ozon().update_attributes(items)
         log(f"Характеристики: отправлена замена «{search_text}» → «{replacement_text}»; значений: {len(matches)}, товаров: {len(items)}")
-        notify(f"Ozon Помощник: отправлена замена «{search_text}» → «{replacement_text}» для {len(items)} товаров")
+        notify(f"OZON Assistant: отправлена замена «{search_text}» → «{replacement_text}» для {len(items)} товаров")
         message = f"Замена отправлена в Ozon: {len(matches)} значений в {len(items)} товарах"
         if skipped_videos:
             message += f"; названия видео пропущены: {len(skipped_videos)}"
@@ -661,6 +719,28 @@ def product_cost(pid):
     with db() as c:
         c.execute("UPDATE products SET cost=?,commission_pct=?,logistics=? WHERE product_id=?", (float(x.get("cost",0)), float(x.get("commission_pct",0)), float(x.get("logistics",0)), pid))
     return jsonify(ok=True)
+
+
+@app.post("/api/cost-rules/apply")
+def cost_rule_apply():
+    x = request.json or {}
+    prefix = str(x.get("prefix") or "").strip().upper()
+    try:
+        cost = float(x.get("cost"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Введите себестоимость числом"), 400
+    if not prefix:
+        return jsonify(ok=False, message="Введите начало артикула"), 400
+    if cost < 0:
+        return jsonify(ok=False, message="Себестоимость не может быть отрицательной"), 400
+    rules = [rule for rule in cost_rules() if rule["prefix"] != prefix]
+    rules.append({"prefix": prefix, "cost": cost})
+    rules.sort(key=lambda rule: len(rule["prefix"]), reverse=True)
+    save_setting("cost_rules", json.dumps(rules, ensure_ascii=False))
+    changed = apply_one_cost_rule(prefix, cost, force=True)
+    log(f"Локальное правило себестоимости {prefix}: обновлено товаров {changed}")
+    return jsonify(ok=True, changed=changed, rules=rules,
+                   message=f"Себестоимость сохранена локально. Обновлено товаров: {changed}")
 
 
 @app.post("/api/product/<int:pid>/competitor")
@@ -724,4 +804,5 @@ def answer(mid):
 
 if __name__ == "__main__":
     init_db()
+    apply_cost_rules(force=False)
     serve(app, host="127.0.0.1", port=8765, threads=8)

@@ -35,7 +35,7 @@ def main():
                 shutil.copytree(src, dst, dirs_exist_ok=True)
             else:
                 shutil.copy2(src, dst)
-    print("Ozon Помощник успешно обновлён")
+    print("OZON Assistant успешно обновлён")
 
 
 if __name__ == "__main__":

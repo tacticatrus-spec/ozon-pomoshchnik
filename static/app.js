@@ -8,6 +8,7 @@ function render(){
  $('proposals').innerHTML=data.proposals.map(p=>`<div class="proposal"><b>${money(p.current_price)} → ${money(p.proposed_price)}</b><div class="hint">${esc(p.reason)}</div><div class="actions"><button class="primary" onclick="proposal(${p.id},'approve')">Подтвердить цену</button><button onclick="proposal(${p.id},'reject')">Отклонить</button></div></div>`).join('')||'<p class="hint">Нет предложений на рассмотрении</p>';
  $('ordersBody').innerHTML=data.orders.map(o=>`<tr><td>${esc(o.posting_number)}</td><td><span class="pill">${o.scheme}</span></td><td>${esc(o.status)}</td><td>${esc(o.created_at)}</td><td>${money(o.amount)}</td></tr>`).join('');
  $('messagesList').innerHTML=data.messages.map(m=>`<div class="message"><small>${m.kind==='review'?'Отзыв':'Вопрос'} • ${esc(m.created_at)}</small><p>${esc(m.text)}</p>${m.status!=='PROCESSED'?`<textarea class="answer" id="a${m.id}" placeholder="Введите ответ"></textarea><button class="primary" onclick="answer('${m.id}')">Отправить ответ</button>`:'<span class="good">Обработано</span>'}</div>`).join('')||'<p class="hint">Новых отзывов и вопросов нет</p>';
+ $('costRules').innerHTML=(data.cost_rules||[]).map(r=>`<div class="event"><b>${esc(r.prefix)}</b> — ${money(r.cost)}</div>`).join('')||'<p class="hint">Правила пока не заданы.</p>';
 }
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active');$('title').textContent=b.textContent});
@@ -78,6 +79,11 @@ async function replaceAttributes(){
  }catch(e){toast(e.message,true)}finally{$('replaceAttributesButton').disabled=false}
 }
 async function saveCost(id){try{await api(`/api/product/${id}/cost`,{method:'POST',body:JSON.stringify({cost:$('c'+id).value,commission_pct:$('f'+id).value,logistics:$('l'+id).value})});toast('Расходы сохранены');load()}catch(e){toast(e.message,true)}}
+async function applyCostRule(){
+ const prefix=$('costPrefix').value.trim(),cost=$('costRuleValue').value;
+ if(!prefix||cost===''){toast('Укажите начало артикула и себестоимость',true);return}
+ try{let x=await api('/api/cost-rules/apply',{method:'POST',body:JSON.stringify({prefix,cost})});toast(x.message);$('costPrefix').value='';$('costRuleValue').value='';await load()}catch(e){toast(e.message,true)}
+}
 async function competitor(id){try{let x=await api(`/api/product/${id}/competitor`,{method:'POST'});toast(x.price?'Цена конкурента: '+money(x.price):'Ozon не вернул цену конкурента');load()}catch(e){toast(e.message,true)}}
 async function propose(id){let margin=prompt('Минимальная желаемая прибыль, %','15');if(margin===null)return;try{let x=await api(`/api/product/${id}/propose`,{method:'POST',body:JSON.stringify({margin_pct:margin})});toast('Предложенная цена: '+money(x.price));load()}catch(e){toast(e.message,true)}}
 async function proposal(id,action){if(action==='approve'&&!confirm('Отправить новую цену в Ozon?'))return;try{await api(`/api/proposal/${id}/${action}`,{method:'POST'});toast(action==='approve'?'Цена отправлена в Ozon':'Предложение отклонено');load()}catch(e){toast(e.message,true)}}
