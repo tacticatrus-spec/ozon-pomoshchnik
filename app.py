@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.4.8"
+VERSION = "0.5.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -42,7 +42,9 @@ def init_db():
           product_id INTEGER PRIMARY KEY, offer_id TEXT, name TEXT, sku INTEGER,
           price REAL DEFAULT 0, old_price REAL DEFAULT 0, competitor_price REAL,
           stock INTEGER DEFAULT 0, cost REAL DEFAULT 0, commission_pct REAL DEFAULT 0,
-          logistics REAL DEFAULT 0, updated_at TEXT
+          logistics REAL DEFAULT 0, updated_at TEXT,
+          seller_price REAL DEFAULT 0, buyer_price REAL DEFAULT 0,
+          ozon_min_price REAL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS proposals(
           id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL,
@@ -61,6 +63,11 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, message TEXT, created_at TEXT
         );
         """)
+        # Existing installations keep their database; add new columns in place.
+        columns = {row[1] for row in c.execute("PRAGMA table_info(products)")}
+        for name in ("seller_price", "buyer_price", "ozon_min_price"):
+            if name not in columns:
+                c.execute(f"ALTER TABLE products ADD COLUMN {name} REAL DEFAULT 0")
 
 
 def setting(key, default=""):
@@ -72,6 +79,66 @@ def setting(key, default=""):
 def save_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def number(value, default=0.0):
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def target_margin_pct():
+    return min(90.0, max(0.0, number(setting("target_margin_pct", "15"), 15)))
+
+
+def profit_metrics(product, margin_pct=None):
+    """Local management estimate. No cost or margin data is sent to Ozon."""
+    margin_pct = target_margin_pct() if margin_pct is None else number(margin_pct, 15)
+    seller_price = number(product.get("seller_price")) or number(product.get("price"))
+    buyer_price = number(product.get("buyer_price")) or seller_price
+    cost = number(product.get("cost"))
+    logistics = number(product.get("logistics"))
+    commission_pct = min(99.0, max(0.0, number(product.get("commission_pct"))))
+    commission = seller_price * commission_pct / 100
+    profit = seller_price - cost - logistics - commission
+    margin = profit / seller_price * 100 if seller_price > 0 else 0
+    break_even_denominator = 1 - commission_pct / 100
+    safe_denominator = 1 - (commission_pct + margin_pct) / 100
+    break_even = (cost + logistics) / break_even_denominator if break_even_denominator > 0 else 0
+    safe_price = (cost + logistics) / safe_denominator if safe_denominator > 0 else 0
+    if cost <= 0:
+        status = "missing_cost"
+    elif profit < 0:
+        status = "loss"
+    elif margin < margin_pct:
+        status = "below_margin"
+    else:
+        status = "safe"
+    return {
+        "seller_price": round(seller_price, 2),
+        "buyer_price": round(buyer_price, 2),
+        "commission": round(commission, 2),
+        "profit": round(profit, 2),
+        "margin_pct": round(margin, 2),
+        "break_even_price": round(break_even, 2),
+        "safe_price": round(safe_price, 2),
+        "profit_status": status,
+    }
+
+
+def profit_report(products=None, margin_pct=None):
+    if products is None:
+        with db() as c:
+            products = [dict(row) for row in c.execute("SELECT * FROM products")]
+    summary = {"loss": 0, "below_margin": 0, "missing_cost": 0, "safe": 0}
+    enriched = []
+    for product in products:
+        item = dict(product)
+        item.update(profit_metrics(item, margin_pct))
+        summary[item["profit_status"]] += 1
+        enriched.append(item)
+    return enriched, summary
 
 
 def cost_rules():
@@ -273,7 +340,10 @@ def demo_data():
         (102, "DEMO-002", "Второй товар", 900002, 2490, 2890, 2590, 7, 1100, 17, 130, now),
     ]
     with db() as c:
-        c.executemany("INSERT OR REPLACE INTO products VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        c.executemany("""INSERT OR REPLACE INTO products(
+            product_id,offer_id,name,sku,price,old_price,competitor_price,
+            stock,cost,commission_pct,logistics,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
     log("Загружены демонстрационные товары")
 
 
@@ -300,19 +370,46 @@ def sync_products():
             b = base.get(pid, {})
             d = details.get(pid, {})
             p = x.get("price", {})
-            current = float(p.get("marketing_price") or p.get("price") or x.get("price", 0) or 0)
-            old = float(p.get("old_price") or x.get("old_price", 0) or 0)
-            c.execute("""INSERT INTO products(product_id,offer_id,name,sku,price,old_price,stock,updated_at)
-              VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET
+            seller_price = number(p.get("marketing_seller_price"))
+            if seller_price <= 0:
+                seller_price = number(p.get("price") or x.get("price"))
+            buyer_price = number(p.get("marketing_price"))
+            if buyer_price <= 0:
+                buyer_price = seller_price
+            old = number(p.get("old_price") or x.get("old_price"))
+            ozon_min = number(p.get("min_price") or x.get("min_price"))
+            c.execute("""INSERT INTO products(
+                product_id,offer_id,name,sku,price,old_price,stock,updated_at,
+                seller_price,buyer_price,ozon_min_price
+              ) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET
               offer_id=excluded.offer_id,name=excluded.name,sku=excluded.sku,price=excluded.price,
-              old_price=excluded.old_price,stock=excluded.stock,updated_at=excluded.updated_at""",
+              old_price=excluded.old_price,stock=excluded.stock,updated_at=excluded.updated_at,
+              seller_price=excluded.seller_price,buyer_price=excluded.buyer_price,
+              ozon_min_price=excluded.ozon_min_price""",
               (pid, x.get("offer_id") or d.get("offer_id") or b.get("offer_id", ""),
                d.get("name") or x.get("name") or b.get("name") or f"Товар {pid}",
-               d.get("sku") or x.get("sku", 0), current, old, stock_map.get(pid, 0), now))
+               d.get("sku") or x.get("sku", 0), seller_price, old, stock_map.get(pid, 0), now,
+               seller_price, buyer_price, ozon_min))
     log(f"Синхронизировано товаров: {len(prices)}")
     apply_cost_rules(force=False)
     notify(f"OZON Assistant: синхронизировано товаров — {len(prices)}")
+    notify_profit_risks()
     return len(prices)
+
+
+def notify_profit_risks():
+    _, summary = profit_report()
+    signature = json.dumps(summary, sort_keys=True)
+    if signature == setting("last_profit_alert_signature"):
+        return
+    save_setting("last_profit_alert_signature", signature)
+    risky = summary["loss"] + summary["below_margin"]
+    if risky:
+        notify(
+            "OZON Assistant — Защитник прибыли: "
+            f"в убытке {summary['loss']}, ниже целевой маржи {summary['below_margin']}. "
+            "Откройте раздел «Товары и цены». Цены автоматически не менялись."
+        )
 
 
 def attribute_replacements(search_text, replacement_text):
@@ -427,11 +524,11 @@ def dashboard():
         events = [dict(x) for x in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 30")]
         proposals = [dict(x) for x in c.execute("SELECT * FROM proposals WHERE status='pending' ORDER BY id DESC")]
         order_count = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-    for p in products:
-        fee = p["price"] * p["commission_pct"] / 100
-        p["profit"] = round(p["price"] - p["cost"] - fee - p["logistics"], 2)
+    margin = target_margin_pct()
+    products, risk_summary = profit_report(products, margin)
     return jsonify(products=products, orders=orders, order_count=order_count, messages=messages, events=events, proposals=proposals,
                    cost_rules=cost_rules(),
+                   target_margin_pct=margin, risk_summary=risk_summary,
                    version=VERSION,
                    configured=bool(secret("client_id") and secret("api_key")), telegram=bool(secret("telegram_token") and setting("telegram_chat_id")))
 
@@ -485,6 +582,21 @@ def settings_save():
                 return jsonify(ok=False, message=f"Хранилище паролей недоступно: {e}"), 500
     if "telegram_chat_id" in x: save_setting("telegram_chat_id", x["telegram_chat_id"].strip())
     return jsonify(ok=True)
+
+
+@app.post("/api/profit-protection/settings")
+def profit_protection_settings():
+    try:
+        margin = float((request.json or {}).get("target_margin_pct"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Введите целевую маржу числом"), 400
+    if not 0 <= margin <= 90:
+        return jsonify(ok=False, message="Целевая маржа должна быть от 0 до 90%"), 400
+    save_setting("target_margin_pct", margin)
+    save_setting("last_profit_alert_signature", "")
+    log(f"Целевая маржа изменена: {margin:g}%")
+    return jsonify(ok=True, target_margin_pct=margin,
+                   message=f"Целевая маржа {margin:g}% сохранена локально")
 
 
 @app.post("/api/test")
@@ -716,8 +828,16 @@ def attributes_replace():
 @app.post("/api/product/<int:pid>/cost")
 def product_cost(pid):
     x = request.json or {}
+    try:
+        cost = float(x.get("cost", 0))
+        commission_pct = float(x.get("commission_pct", 0))
+        logistics = float(x.get("logistics", 0))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Себестоимость, комиссия и логистика должны быть числами"), 400
+    if cost < 0 or logistics < 0 or not 0 <= commission_pct < 100:
+        return jsonify(ok=False, message="Проверьте расходы: значения не могут быть отрицательными, комиссия — от 0 до 99%"), 400
     with db() as c:
-        c.execute("UPDATE products SET cost=?,commission_pct=?,logistics=? WHERE product_id=?", (float(x.get("cost",0)), float(x.get("commission_pct",0)), float(x.get("logistics",0)), pid))
+        c.execute("UPDATE products SET cost=?,commission_pct=?,logistics=? WHERE product_id=?", (cost, commission_pct, logistics, pid))
     return jsonify(ok=True)
 
 
@@ -759,9 +879,8 @@ def propose(pid):
     with db() as c:
         p = c.execute("SELECT * FROM products WHERE product_id=?", (pid,)).fetchone()
         if not p: return jsonify(ok=False, message="Товар не найден"), 404
-        floor = p["cost"] + p["logistics"]
-        margin = float(x.get("margin_pct", 15))
-        min_price = floor / max(0.01, 1 - (p["commission_pct"] + margin) / 100)
+        margin = float(x.get("margin_pct", target_margin_pct()))
+        min_price = profit_metrics(dict(p), margin)["safe_price"]
         target = (p["competitor_price"] - 1) if p["competitor_price"] else p["price"]
         proposed = round(max(min_price, target), 2)
         reason = f"Конкурент: {p['competitor_price'] or 'нет данных'}; минимум при марже {margin}%: {min_price:.2f}"
@@ -782,7 +901,7 @@ def proposal_action(proposal_id, action):
         Ozon().set_price(q["offer_id"], q["proposed_price"], q["old_price"])
         with db() as c:
             c.execute("UPDATE proposals SET status='approved' WHERE id=?", (proposal_id,))
-            c.execute("UPDATE products SET price=? WHERE product_id=?", (q["proposed_price"], q["product_id"]))
+            c.execute("UPDATE products SET price=?,seller_price=? WHERE product_id=?", (q["proposed_price"], q["proposed_price"], q["product_id"]))
         notify(f"Цена {q['offer_id']} изменена: {q['current_price']} → {q['proposed_price']} ₽")
         return jsonify(ok=True)
     except Exception as e: return jsonify(ok=False, message=str(e)), 400
