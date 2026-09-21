@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -68,6 +68,8 @@ def init_db():
         for name in ("seller_price", "buyer_price", "ozon_min_price"):
             if name not in columns:
                 c.execute(f"ALTER TABLE products ADD COLUMN {name} REAL DEFAULT 0")
+        if "image_url" not in columns:
+            c.execute("ALTER TABLE products ADD COLUMN image_url TEXT DEFAULT ''")
 
 
 def setting(key, default=""):
@@ -347,6 +349,20 @@ def demo_data():
     log("Загружены демонстрационные товары")
 
 
+def product_image(product):
+    """Accept image formats returned by Seller API; never render unsafe URLs."""
+    for field in ("primary_image", "images", "image"):
+        values = product.get(field) or []
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("file_name") or value.get("url")
+            if isinstance(value, str) and value.startswith("https://"):
+                return value
+    return ""
+
+
 def sync_products():
     api = Ozon()
     listing = api.product_ids()
@@ -357,6 +373,15 @@ def sync_products():
     except OzonError as e:
         details = {}
         log(f"Названия товаров: {e}", "warning")
+    image_map = {pid: product_image(item) for pid, item in details.items()}
+    if any(not image_map.get(pid) for pid in base):
+        try:
+            for card in api.product_attributes():
+                pid = int(card.get("id") or card.get("product_id") or 0)
+                if not image_map.get(pid):
+                    image_map[pid] = product_image(card)
+        except OzonError as e:
+            log(f"Фотографии товаров: {e}", "warning")
     stocks = api.stocks()
     stock_map = {}
     for x in stocks:
@@ -390,6 +415,9 @@ def sync_products():
                d.get("name") or x.get("name") or b.get("name") or f"Товар {pid}",
                d.get("sku") or x.get("sku", 0), seller_price, old, stock_map.get(pid, 0), now,
                seller_price, buyer_price, ozon_min))
+            if pid in image_map:
+                c.execute("UPDATE products SET image_url=? WHERE product_id=?",
+                          (image_map[pid], pid))
     log(f"Синхронизировано товаров: {len(prices)}")
     apply_cost_rules(force=False)
     notify(f"OZON Assistant: синхронизировано товаров — {len(prices)}")
