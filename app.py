@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -61,6 +61,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, message TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS seo_positions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, offer_id TEXT NOT NULL,
+          query TEXT NOT NULL, position INTEGER NOT NULL, checked_at TEXT NOT NULL
         );
         """)
         # Existing installations keep their database; add new columns in place.
@@ -197,6 +201,63 @@ def apply_one_cost_rule(prefix, cost, force=True):
                 c.execute("UPDATE products SET cost=? WHERE product_id=?", (cost, row["product_id"]))
                 changed += 1
     return changed
+
+
+SEO_TOPICS = [
+    (("CATJUDO", "ДЗЮДО", "JUDO"), "дзюдоиста", ("шеврон дзюдоиста", "нашивка дзюдо", "патч дзюдоиста")),
+    (("CATBJJ", "ДЖИУ", "BJJ"), "джиу-джитсу", ("шеврон джиу джитсу", "нашивка джиу джитсу", "патч BJJ")),
+    (("CATSAMBO", "САМБО"), "самбиста", ("шеврон самбиста", "нашивка самбо", "патч самбиста")),
+    (("CATSUMO", "СУМО"), "сумоиста", ("шеврон сумоиста", "нашивка сумо", "патч сумоиста")),
+    (("CATFOOTBALL", "ФУТБОЛ"), "футболиста", ("шеврон футболиста", "нашивка футбол", "патч футболиста")),
+    (("АРТИЛЛЕР",), "артиллериста", ("шеврон артиллериста", "нашивка артиллериста", "патч артиллериста")),
+    (("ПОГРАНИЧ",), "пограничника", ("шеврон пограничника", "нашивка пограничника", "патч пограничника")),
+    (("СВЯЗИСТ",), "связиста", ("шеврон связиста", "нашивка связиста", "патч связиста")),
+    (("САПЕР", "САПЁР"), "сапёра", ("шеврон сапёра", "нашивка сапёра", "патч сапёра")),
+    (("МОРЯК",), "моряка", ("шеврон моряка", "нашивка моряка", "патч моряка")),
+    (("ВОДИТЕЛ",), "военного водителя", ("шеврон военного водителя", "нашивка водителя", "патч водителя")),
+    (("АВТОМАТЧИК",), "автоматчика", ("шеврон автоматчика", "нашивка автоматчика", "патч автоматчика")),
+    (("НОЖЕМАН",), "ножемана", ("шеврон ножемана", "нашивка ножемана", "патч ножемана")),
+    (("ЧЕКИСТ",), "чекиста", ("шеврон чекиста", "нашивка чекиста", "патч чекиста")),
+    (("ОДОН",), "ОДОН", ("шеврон ОДОН", "нашивка ОДОН", "патч ОДОН")),
+    (("АРХАНГЕЛ",), "Архангел спецназа", ("шеврон Архангел спецназа", "нашивка спецназ", "патч Архангел")),
+    (("ШТУРМОВИК",), "штурмовика", ("шеврон штурмовика", "нашивка штурмовика", "патч штурмовика")),
+    (("ВОЛОНТЕР", "ВОЛОНТЁР"), "волонтёра", ("шеврон волонтёра", "нашивка волонтёра", "патч волонтёра")),
+]
+
+
+def seo_card_plan(product):
+    """Build a conservative, review-only SEO plan; it never writes to Ozon."""
+    offer_id = str(product.get("offer_id") or "")
+    name = str(product.get("name") or "")
+    haystack = f"{offer_id} {name}".upper()
+    if offer_id.upper().startswith("TT-L-"):
+        if "VBD" in haystack or "ВЕТЕРАН" in haystack:
+            queries = ("корочка ветерана боевых действий", "обложка удостоверения ВБД", "корочка ВБД")
+        elif "PFSB" in haystack or "ФСБ" in haystack:
+            queries = ("обложка для паспорта ФСБ", "обложка ФСБ", "обложка для паспорта бордовая")
+        elif "PGRF" in haystack or "ГЕРБ" in haystack:
+            queries = ("обложка для паспорта с гербом России", "обложка паспорт герб", "обложка для паспорта бордовая")
+        else:
+            queries = ("обложка для удостоверения военнослужащего", "обложка военного удостоверения", "обложка для документов")
+        return {"group": "TT-L-", "queries": queries, "suggested_name": name, "needs_title_review": False}
+
+    label = ""
+    queries = ()
+    for needles, candidate_label, candidate_queries in SEO_TOPICS:
+        if any(token in haystack for token in needles):
+            label, queries = candidate_label, candidate_queries
+            break
+    if not queries:
+        words = re.sub(r"[^0-9A-Za-zА-Яа-яЁё -]+", " ", name)
+        words = re.sub(r"\b(?:шеврон|нашивка|патч|липучке|пвх|tacticat|3d|товар)\b", " ", words, flags=re.I)
+        words = re.sub(r"\s+", " ", words).strip(" -")
+        label = " ".join(words.split()[:4]) or offer_id
+        queries = (f"шеврон {label}", f"нашивка {label}", f"патч {label}")
+    size = re.search(r"\d+(?:[.,]\d+)?\s*[xх×]\s*\d+(?:[.,]\d+)?\s*см", name, re.I)
+    size_text = f", {size.group(0).replace('x', '×').replace('х', '×')}" if size else ""
+    suggested = f"Шеврон {label} на липучке ПВХ 3D{size_text}, TACTICAT"
+    group = "TT-P-" if offer_id.upper().startswith("TT-P-") else "ZV-" if offer_id.upper().startswith("ZV-") else "Другое"
+    return {"group": group, "queries": queries, "suggested_name": suggested, "needs_title_review": suggested.casefold() != name.casefold()}
 
 
 def log(message, level="info"):
@@ -559,6 +620,79 @@ def dashboard():
                    target_margin_pct=margin, risk_summary=risk_summary,
                    version=VERSION,
                    configured=bool(secret("client_id") and secret("api_key")), telegram=bool(secret("telegram_token") and setting("telegram_chat_id")))
+
+
+@app.get("/api/seo/audit")
+def seo_audit():
+    group = str(request.args.get("group", "ALL")).strip().upper()
+    prefixes = {
+        "ALL": ("TT-P-", "TT-L-", "ZV-"),
+        "TT-P": ("TT-P-",),
+        "TT-L": ("TT-L-",),
+        "ZV": ("ZV-",),
+    }.get(group)
+    if prefixes is None:
+        return jsonify(ok=False, message="Неизвестная группа карточек"), 400
+    with db() as c:
+        products = [dict(row) for row in c.execute("SELECT * FROM products ORDER BY offer_id")]
+        latest_rows = c.execute("""
+          SELECT p.offer_id,p.query,p.position,p.checked_at
+          FROM seo_positions p
+          JOIN (SELECT offer_id,query,MAX(id) id FROM seo_positions GROUP BY offer_id,query) x ON x.id=p.id
+        """).fetchall()
+    latest = {(row["offer_id"], row["query"]): dict(row) for row in latest_rows}
+    items = []
+    for product in products:
+        offer_id = str(product.get("offer_id") or "")
+        if not offer_id.upper().startswith(prefixes):
+            continue
+        plan = seo_card_plan(product)
+        positions = [latest.get((offer_id, query), {}) for query in plan["queries"]]
+        items.append({
+            "product_id": product.get("product_id"), "offer_id": offer_id,
+            "name": product.get("name", ""), "image_url": product.get("image_url", ""),
+            **plan, "positions": positions,
+        })
+    return jsonify(ok=True, group=group, count=len(items), items=items)
+
+
+@app.post("/api/seo/position")
+def seo_position_save():
+    x = request.json or {}
+    offer_id = str(x.get("offer_id") or "").strip()
+    query = str(x.get("query") or "").strip()
+    try:
+        position = int(x.get("position"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Введите место числом; 0 — карточка не найдена"), 400
+    if not offer_id or not query or not 0 <= position <= 10000:
+        return jsonify(ok=False, message="Проверьте артикул, запрос и место"), 400
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("INSERT INTO seo_positions(offer_id,query,position,checked_at) VALUES(?,?,?,?)",
+                  (offer_id, query, position, checked_at))
+    return jsonify(ok=True, message=f"Позиция сохранена: {position if position else 'не найдено'}", checked_at=checked_at)
+
+
+@app.get("/api/seo/history")
+def seo_history():
+    offer_id = str(request.args.get("offer_id") or "").strip()
+    query = str(request.args.get("query") or "").strip()
+    sql = "SELECT offer_id,query,position,checked_at FROM seo_positions"
+    values = []
+    where = []
+    if offer_id:
+        where.append("offer_id=?")
+        values.append(offer_id)
+    if query:
+        where.append("query=?")
+        values.append(query)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT 500"
+    with db() as c:
+        rows = [dict(row) for row in c.execute(sql, values)]
+    return jsonify(ok=True, items=rows)
 
 
 def version_tuple(value):
