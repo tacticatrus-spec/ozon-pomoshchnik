@@ -40,7 +40,7 @@ async function previewTTOptimization(){
   $('applyTTOptimization').style.display='none';
   let x=await api('/api/optimization/tt/preview');ttOptimizationReady=x.found>0;
   $('ttOptimizationPreview').innerHTML=`<p><b>Найдено карточек: ${x.found} из ${x.count}</b></p><div class="tablewrap"><table><thead><tr><th>Артикул</th><th>Сейчас</th><th>Будет</th></tr></thead><tbody>${x.items.map(i=>`<tr><td><b>${esc(i.offer_id)}</b>${i.found?'':'<br><span class="bad">Не найден</span>'}</td><td>${esc(i.old_name)}</td><td><b>${esc(i.new_name)}</b></td></tr>`).join('')}</tbody></table></div><p class="hint">Будут заменены только название, описание и поисковые фразы. Цена, остаток, фотографии и отзывы сохранятся.</p>`;
-  $('applyTTOptimization').style.display=ttOptimizationReady?'inline-block':'none';
+  $('applyTTOptimization').style.display='none';
  }catch(e){$('ttOptimizationPreview').innerHTML='';toast(e.message,true)}
 }
 async function applyTTOptimization(){
@@ -51,6 +51,26 @@ async function applyTTOptimization(){
   let x=await api('/api/optimization/tt/apply',{method:'POST',body:JSON.stringify({confirmed:true})});
   toast(x.message);$('ttOptimizationPreview').innerHTML=`<p class="good">${esc(x.message)}</p><p class="hint">Ozon обработает изменения в очереди. Это может занять несколько минут.</p>`;$('applyTTOptimization').style.display='none';ttOptimizationReady=false;
  }catch(e){toast(e.message,true)}finally{$('applyTTOptimization').disabled=false}
+}
+let seoItems=[];
+async function loadSeoAudit(){
+ const group=$('seoGroup').value;
+ try{
+  $('seoSummary').innerHTML='<p class="hint">Анализирую карточки TT и ZV…</p>';$('seoAudit').innerHTML='';
+  let x=await api('/api/seo/audit?group='+encodeURIComponent(group));seoItems=x.items||[];
+  let counts=seoItems.reduce((a,i)=>(a[i.group]=(a[i.group]||0)+1,a),{});
+  $('seoSummary').innerHTML=`<p><b>Карточек: ${x.count}</b> · ${Object.entries(counts).map(([k,v])=>esc(k)+': '+v).join(' · ')}</p><p class="hint">0 означает, что карточка не найдена в пределах проверенной выдачи.</p>`;
+  $('seoAudit').innerHTML=seoItems.map((i,idx)=>`<div class="seo-card"><div class="seo-head">${productPhoto(i)}<div><span class="pill">${esc(i.group)}</span><h3>${esc(i.offer_id)}</h3><p>${esc(i.name)}</p></div></div><div class="seo-suggestion"><small>Рекомендуемое название для проверки</small><b>${esc(i.suggested_name)}</b>${i.needs_title_review?'<span class="status below_margin">Требует проверки</span>':'<span class="status safe">Название оставляем</span>'}</div><div class="seo-queries">${i.queries.map((q,qi)=>{let p=i.positions[qi]||{};return `<div class="seo-query"><div><b>${esc(q)}</b><small>${p.checked_at?'Последнее место: '+(p.position||'не найдено')+' · '+esc(p.checked_at):'Исходное место ещё не сохранено'}</small></div><button onclick="openSeoSearch(${idx},${qi})">Открыть поиск</button><input id="seoPos${idx}_${qi}" type="number" min="0" max="10000" placeholder="Место"><button class="primary" onclick="saveSeoPosition(${idx},${qi})">Сохранить</button></div>`}).join('')}</div></div>`).join('')||'<div class="panel"><p class="hint">Карточек этой группы пока нет. Сначала выполните синхронизацию.</p></div>';
+ }catch(e){$('seoSummary').innerHTML='';toast(e.message,true)}
+}
+function openSeoSearch(itemIndex,queryIndex){
+ const query=seoItems[itemIndex].queries[queryIndex];
+ window.open('https://www.ozon.ru/search/?from_global=true&text='+encodeURIComponent(query),'_blank','noopener');
+}
+async function saveSeoPosition(itemIndex,queryIndex){
+ const item=seoItems[itemIndex],query=item.queries[queryIndex],input=$(`seoPos${itemIndex}_${queryIndex}`);
+ if(input.value===''){toast('Введите место; 0 — товар не найден',true);return}
+ try{let x=await api('/api/seo/position',{method:'POST',body:JSON.stringify({offer_id:item.offer_id,query,position:input.value})});toast(x.message);await loadSeoAudit()}catch(e){toast(e.message,true)}
 }
 let attributeMatches=[];
 async function findAttributes(){
