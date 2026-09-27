@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -64,7 +64,20 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS seo_positions(
           id INTEGER PRIMARY KEY AUTOINCREMENT, offer_id TEXT NOT NULL,
-          query TEXT NOT NULL, position INTEGER NOT NULL, checked_at TEXT NOT NULL
+          query TEXT NOT NULL, position INTEGER NOT NULL, checked_at TEXT NOT NULL,
+          region TEXT DEFAULT '', search_depth INTEGER DEFAULT 0,
+          browser_mode TEXT DEFAULT '', note TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS seo_queries(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, offer_id TEXT NOT NULL,
+          query TEXT NOT NULL, priority INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL,
+          UNIQUE(offer_id, query)
+        );
+        CREATE TABLE IF NOT EXISTS seller_rank_history(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL,
+          rank INTEGER NOT NULL, top_percent REAL,
+          checked_at TEXT NOT NULL, note TEXT DEFAULT ''
         );
         """)
         # Existing installations keep their database; add new columns in place.
@@ -74,6 +87,17 @@ def init_db():
                 c.execute(f"ALTER TABLE products ADD COLUMN {name} REAL DEFAULT 0")
         if "image_url" not in columns:
             c.execute("ALTER TABLE products ADD COLUMN image_url TEXT DEFAULT ''")
+        seo_columns = {row[1] for row in c.execute("PRAGMA table_info(seo_positions)")}
+        for name, definition in (
+            ("region", "TEXT DEFAULT ''"),
+            ("search_depth", "INTEGER DEFAULT 0"),
+            ("browser_mode", "TEXT DEFAULT ''"),
+            ("note", "TEXT DEFAULT ''"),
+        ):
+            if name not in seo_columns:
+                c.execute(f"ALTER TABLE seo_positions ADD COLUMN {name} {definition}")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_seo_positions_offer_query ON seo_positions(offer_id, query, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_seo_queries_offer ON seo_queries(offer_id, priority, id)")
 
 
 def setting(key, default=""):
@@ -255,9 +279,63 @@ def seo_card_plan(product):
         queries = (f"шеврон {label}", f"нашивка {label}", f"патч {label}")
     size = re.search(r"\d+(?:[.,]\d+)?\s*[xх×]\s*\d+(?:[.,]\d+)?\s*см", name, re.I)
     size_text = f", {size.group(0).replace('x', '×').replace('х', '×')}" if size else ""
-    suggested = f"Шеврон {label} на липучке ПВХ 3D{size_text}, TACTICAT"
-    group = "TT-P-" if offer_id.upper().startswith("TT-P-") else "ZV-" if offer_id.upper().startswith("ZV-") else "Другое"
+    unique_label = ""
+    if offer_id.upper().startswith("TT-P-") and ("CAT" in haystack or "КОТ" in haystack):
+        unique_label = {
+            "дзюдоиста": " «Кот-дзюдоист»",
+            "джиу-джитсу": " «Кот-боец»",
+            "самбиста": " «Кот-самбист»",
+            "сумоиста": " «Кот-сумоист»",
+            "футболиста": " «Кот-футболист»",
+        }.get(label, " «Кот»")
+    suggested = f"Шеврон {label}{unique_label} ПВХ 3D на липучке{size_text}, TACTICAT"
+    upper_offer = offer_id.upper()
+    group = "TT-P-" if upper_offer.startswith("TT-P-") else "TT-L-" if upper_offer.startswith("TT-L-") else "TT-" if upper_offer.startswith("TT-") else "ZV-" if upper_offer.startswith("ZV-") else "Другое"
     return {"group": group, "queries": queries, "suggested_name": suggested, "needs_title_review": suggested.casefold() != name.casefold()}
+
+
+def saved_seo_queries(offer_id):
+    with db() as c:
+        rows = c.execute(
+            "SELECT query FROM seo_queries WHERE offer_id=? ORDER BY priority,id",
+            (offer_id,),
+        ).fetchall()
+    return [row["query"] for row in rows]
+
+
+def seo_position_summary(rows):
+    by_key = {}
+    for row in rows:
+        by_key.setdefault((row["offer_id"], row["query"]), []).append(dict(row))
+    summary = {"top10": 0, "top20": 0, "top50": 0, "not_found": 0, "improved": 0, "declined": 0, "unchanged": 0}
+    latest = {}
+    for key, checks in by_key.items():
+        current = checks[0]
+        previous = checks[1] if len(checks) > 1 else None
+        position = int(current["position"] or 0)
+        if position == 0:
+            summary["not_found"] += 1
+        if 0 < position <= 10:
+            summary["top10"] += 1
+        if 0 < position <= 20:
+            summary["top20"] += 1
+        if 0 < position <= 50:
+            summary["top50"] += 1
+        delta = None
+        if previous is not None:
+            old = int(previous["position"] or 0)
+            if position and old:
+                delta = old - position
+            elif position and not old:
+                delta = 1
+            elif not position and old:
+                delta = -1
+            if delta is not None:
+                summary["improved" if delta > 0 else "declined" if delta < 0 else "unchanged"] += 1
+        current["previous_position"] = previous["position"] if previous else None
+        current["delta"] = delta
+        latest[key] = current
+    return latest, summary
 
 
 def log(message, level="info"):
@@ -626,7 +704,8 @@ def dashboard():
 def seo_audit():
     group = str(request.args.get("group", "ALL")).strip().upper()
     prefixes = {
-        "ALL": ("TT-P-", "TT-L-", "ZV-"),
+        "ALL": ("TT-", "ZV-"),
+        "TT": ("TT-",),
         "TT-P": ("TT-P-",),
         "TT-L": ("TT-L-",),
         "ZV": ("ZV-",),
@@ -635,25 +714,95 @@ def seo_audit():
         return jsonify(ok=False, message="Неизвестная группа карточек"), 400
     with db() as c:
         products = [dict(row) for row in c.execute("SELECT * FROM products ORDER BY offer_id")]
-        latest_rows = c.execute("""
-          SELECT p.offer_id,p.query,p.position,p.checked_at
-          FROM seo_positions p
-          JOIN (SELECT offer_id,query,MAX(id) id FROM seo_positions GROUP BY offer_id,query) x ON x.id=p.id
+        position_rows = c.execute("""
+          SELECT offer_id,query,position,checked_at,region,search_depth,browser_mode,note
+          FROM seo_positions ORDER BY id DESC
         """).fetchall()
-    latest = {(row["offer_id"], row["query"]): dict(row) for row in latest_rows}
+        seller_rank = c.execute("SELECT category,rank,top_percent,checked_at,note FROM seller_rank_history ORDER BY id DESC LIMIT 1").fetchone()
+    latest, _ = seo_position_summary(position_rows)
     items = []
     for product in products:
         offer_id = str(product.get("offer_id") or "")
         if not offer_id.upper().startswith(prefixes):
             continue
         plan = seo_card_plan(product)
+        custom_queries = saved_seo_queries(offer_id)
+        if custom_queries:
+            plan["queries"] = custom_queries
         positions = [latest.get((offer_id, query), {}) for query in plan["queries"]]
         items.append({
             "product_id": product.get("product_id"), "offer_id": offer_id,
-            "name": product.get("name", ""), "image_url": product.get("image_url", ""),
+            "sku": product.get("sku"), "name": product.get("name", ""),
+            "image_url": product.get("image_url", ""), "stock": product.get("stock", 0),
             **plan, "positions": positions,
         })
-    return jsonify(ok=True, group=group, count=len(items), items=items)
+    summary = {"top10": 0, "top20": 0, "top50": 0, "not_found": 0, "improved": 0, "declined": 0, "unchanged": 0}
+    for item in items:
+        for position_data in item["positions"]:
+            if not position_data:
+                continue
+            position = int(position_data.get("position") or 0)
+            if position == 0:
+                summary["not_found"] += 1
+            if 0 < position <= 10:
+                summary["top10"] += 1
+            if 0 < position <= 20:
+                summary["top20"] += 1
+            if 0 < position <= 50:
+                summary["top50"] += 1
+            delta = position_data.get("delta")
+            if delta is not None:
+                summary["improved" if delta > 0 else "declined" if delta < 0 else "unchanged"] += 1
+    return jsonify(ok=True, group=group, count=len(items), items=items, summary=summary,
+                   profile={
+                       "region": setting("seo_region", "Москва"),
+                       "search_depth": int(number(setting("seo_search_depth", "300"), 300)),
+                       "browser_mode": setting("seo_browser_mode", "Чистый браузер"),
+                   }, seller_rank=dict(seller_rank) if seller_rank else None)
+
+
+@app.post("/api/seo/queries")
+def seo_queries_save():
+    x = request.json or {}
+    offer_id = str(x.get("offer_id") or "").strip()
+    incoming = x.get("queries") if isinstance(x.get("queries"), list) else []
+    queries = []
+    for value in incoming:
+        query = re.sub(r"\s+", " ", str(value or "")).strip()
+        if query and query.casefold() not in {item.casefold() for item in queries}:
+            queries.append(query)
+    if not offer_id or not 1 <= len(queries) <= 12:
+        return jsonify(ok=False, message="Укажите артикул и от 1 до 12 поисковых запросов"), 400
+    if any(len(query) > 120 for query in queries):
+        return jsonify(ok=False, message="Поисковый запрос не должен быть длиннее 120 символов"), 400
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db() as c:
+        exists = c.execute("SELECT 1 FROM products WHERE offer_id=?", (offer_id,)).fetchone()
+        if not exists:
+            return jsonify(ok=False, message="Карточка не найдена; сначала выполните синхронизацию"), 404
+        c.execute("DELETE FROM seo_queries WHERE offer_id=?", (offer_id,))
+        c.executemany(
+            "INSERT INTO seo_queries(offer_id,query,priority,created_at) VALUES(?,?,?,?)",
+            [(offer_id, query, index, now) for index, query in enumerate(queries)],
+        )
+    return jsonify(ok=True, queries=queries, message=f"Поисковые запросы сохранены локально: {len(queries)}")
+
+
+@app.post("/api/seo/profile")
+def seo_profile_save():
+    x = request.json or {}
+    region = str(x.get("region") or "").strip()
+    browser_mode = str(x.get("browser_mode") or "").strip()
+    try:
+        search_depth = int(x.get("search_depth"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Глубина проверки должна быть числом"), 400
+    if not region or not browser_mode or not 10 <= search_depth <= 5000:
+        return jsonify(ok=False, message="Проверьте регион, режим браузера и глубину поиска"), 400
+    save_setting("seo_region", region)
+    save_setting("seo_search_depth", search_depth)
+    save_setting("seo_browser_mode", browser_mode)
+    return jsonify(ok=True, message="Условия проверки сохранены локально")
 
 
 @app.post("/api/seo/position")
@@ -667,10 +816,21 @@ def seo_position_save():
         return jsonify(ok=False, message="Введите место числом; 0 — карточка не найдена"), 400
     if not offer_id or not query or not 0 <= position <= 10000:
         return jsonify(ok=False, message="Проверьте артикул, запрос и место"), 400
-    checked_at = datetime.now().isoformat(timespec="seconds")
+    region = str(x.get("region") or setting("seo_region", "Москва")).strip()
+    browser_mode = str(x.get("browser_mode") or setting("seo_browser_mode", "Чистый браузер")).strip()
+    note = str(x.get("note") or "").strip()[:300]
+    try:
+        search_depth = int(x.get("search_depth") or setting("seo_search_depth", "300"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Глубина проверки должна быть числом"), 400
+    if not region or not browser_mode or not 10 <= search_depth <= 5000:
+        return jsonify(ok=False, message="Сначала сохраните корректные условия проверки"), 400
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with db() as c:
-        c.execute("INSERT INTO seo_positions(offer_id,query,position,checked_at) VALUES(?,?,?,?)",
-                  (offer_id, query, position, checked_at))
+        c.execute("""INSERT INTO seo_positions(
+          offer_id,query,position,checked_at,region,search_depth,browser_mode,note
+        ) VALUES(?,?,?,?,?,?,?,?)""",
+                  (offer_id, query, position, checked_at, region, search_depth, browser_mode, note))
     return jsonify(ok=True, message=f"Позиция сохранена: {position if position else 'не найдено'}", checked_at=checked_at)
 
 
@@ -678,7 +838,7 @@ def seo_position_save():
 def seo_history():
     offer_id = str(request.args.get("offer_id") or "").strip()
     query = str(request.args.get("query") or "").strip()
-    sql = "SELECT offer_id,query,position,checked_at FROM seo_positions"
+    sql = "SELECT offer_id,query,position,checked_at,region,search_depth,browser_mode,note FROM seo_positions"
     values = []
     where = []
     if offer_id:
@@ -694,6 +854,41 @@ def seo_history():
         rows = [dict(row) for row in c.execute(sql, values)]
     return jsonify(ok=True, items=rows)
 
+
+@app.post("/api/seo/seller-rank")
+def seo_seller_rank_save():
+    x = request.json or {}
+    category = str(x.get("category") or "Шеврон").strip()
+    note = str(x.get("note") or "").strip()[:300]
+    try:
+        rank = int(x.get("rank"))
+        top_percent = float(x.get("top_percent")) if str(x.get("top_percent") or "").strip() else None
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message="Место и процент должны быть числами"), 400
+    if not category or rank < 1 or (top_percent is not None and not 0 <= top_percent <= 100):
+        return jsonify(ok=False, message="Проверьте категорию, место и процент лучших"), 400
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("INSERT INTO seller_rank_history(category,rank,top_percent,checked_at,note) VALUES(?,?,?,?,?)",
+                  (category, rank, top_percent, checked_at, note))
+        previous = c.execute("SELECT rank FROM seller_rank_history WHERE category=? ORDER BY id DESC LIMIT 1 OFFSET 1", (category,)).fetchone()
+    delta = (previous["rank"] - rank) if previous else None
+    return jsonify(ok=True, rank=rank, delta=delta, checked_at=checked_at,
+                   message=f"Рейтинг продавца сохранён: №{rank}")
+
+
+@app.get("/api/seo/seller-rank")
+def seo_seller_rank_history():
+    category = str(request.args.get("category") or "").strip()
+    sql = "SELECT category,rank,top_percent,checked_at,note FROM seller_rank_history"
+    values = []
+    if category:
+        sql += " WHERE category=?"
+        values.append(category)
+    sql += " ORDER BY id DESC LIMIT 100"
+    with db() as c:
+        rows = [dict(row) for row in c.execute(sql, values)]
+    return jsonify(ok=True, items=rows)
 
 def version_tuple(value):
     try:
@@ -851,40 +1046,11 @@ def tt_optimization_preview():
 
 @app.post("/api/optimization/tt/apply")
 def tt_optimization_apply():
-    x = request.json or {}
-    if x.get("confirmed") is not True:
-        return jsonify(ok=False, message="Нужно подтвердить отправку улучшений"), 400
-    try:
-        package = tt_optimization_data()
-        current_offers = {
-            str(item.get("offer_id") or "")
-            for item in Ozon().product_attributes()
-        }
-        updates = []
-        skipped = []
-        for item in package.get("items", []):
-            offer_id = item["offer_id"]
-            if offer_id not in current_offers:
-                skipped.append(offer_id)
-                continue
-            updates.append({
-                "offer_id": offer_id,
-                "attributes": [
-                    {"id": 4180, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["new_name"]}]},
-                    {"id": 4191, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["description"]}]},
-                    {"id": 23171, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": item["keywords"]}]},
-                ],
-            })
-        if not updates:
-            return jsonify(ok=False, message="Карточки TT не найдены"), 404
-        task_ids = Ozon().update_attributes(updates)
-        log(f"Прокачка TT: отправлено товаров {len(updates)}; пропущено {len(skipped)}")
-        notify(f"OZON Assistant: отправлены улучшения для {len(updates)} карточек TT")
-        return jsonify(ok=True, updated=len(updates), skipped=skipped, task_ids=task_ids,
-                       message=f"Улучшения отправлены в Ozon для {len(updates)} карточек")
-    except Exception as e:
-        log(f"Ошибка прокачки TT: {e}", "error")
-        return jsonify(ok=False, message=str(e)), 400
+    return jsonify(
+        ok=False,
+        read_only=True,
+        message="Массовая SEO-отправка отключена. Версия 0.5.3 работает только в режиме анализа и контроля.",
+    ), 410
 
 
 @app.get("/api/products/export")
