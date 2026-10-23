@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -469,14 +469,15 @@ class Ozon:
         return self.call("/v1/product/import/prices", {"prices": [item]})
 
     def set_auto_add_to_actions(self, offer_ids, enabled=False):
-        """Change only the Ozon auto-add flag; product prices are not included."""
+        """Change only the Ozon auto-add enum; product prices are not included."""
         responses = []
         offer_ids = [str(value).strip() for value in offer_ids if str(value).strip()]
-        for i in range(0, len(offer_ids), 1000):
+        state = "ENABLED" if enabled else "DISABLED"
+        for i in range(0, len(offer_ids), 100):
             prices = [{
                 "offer_id": offer_id,
-                "auto_add_to_ozon_actions_list_enabled": bool(enabled),
-            } for offer_id in offer_ids[i:i + 1000]]
+                "auto_add_to_ozon_actions_list_enabled": state,
+            } for offer_id in offer_ids[i:i + 100]]
             responses.append(self.call("/v1/product/import/prices", {"prices": prices}))
         return responses
 
@@ -1077,7 +1078,7 @@ def promotions_auto_add_disable():
                     })
         after = promotion_auto_add_snapshot()
         remaining = after["summary"]["enabled"]
-        if changed == 0 and not errors and remaining == 0:
+        if changed == 0 and not errors:
             changed = len(offer_ids)
         failed = len(errors)
         verification_pending = remaining > 0 and changed > 0 and not errors
