@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -44,7 +44,9 @@ def init_db():
           stock INTEGER DEFAULT 0, cost REAL DEFAULT 0, commission_pct REAL DEFAULT 0,
           logistics REAL DEFAULT 0, updated_at TEXT,
           seller_price REAL DEFAULT 0, buyer_price REAL DEFAULT 0,
-          ozon_min_price REAL DEFAULT 0
+          ozon_min_price REAL DEFAULT 0,
+          auto_add_to_actions INTEGER DEFAULT -1,
+          auto_add_checked_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS proposals(
           id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL,
@@ -85,6 +87,10 @@ def init_db():
         for name in ("seller_price", "buyer_price", "ozon_min_price"):
             if name not in columns:
                 c.execute(f"ALTER TABLE products ADD COLUMN {name} REAL DEFAULT 0")
+        if "auto_add_to_actions" not in columns:
+            c.execute("ALTER TABLE products ADD COLUMN auto_add_to_actions INTEGER DEFAULT -1")
+        if "auto_add_checked_at" not in columns:
+            c.execute("ALTER TABLE products ADD COLUMN auto_add_checked_at TEXT DEFAULT ''")
         if "image_url" not in columns:
             c.execute("ALTER TABLE products ADD COLUMN image_url TEXT DEFAULT ''")
         seo_columns = {row[1] for row in c.execute("PRAGMA table_info(seo_positions)")}
@@ -116,6 +122,21 @@ def number(value, default=0.0):
         return float(value or default)
     except (TypeError, ValueError):
         return float(default)
+
+
+def optional_bool(value):
+    """Return True/False for API booleans and None when Ozon omitted the field."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "enabled"):
+            return True
+        if normalized in ("false", "0", "no", "disabled"):
+            return False
+    return None
 
 
 def target_margin_pct():
@@ -447,6 +468,18 @@ class Ozon:
             item["old_price"] = str(round(old_price, 2))
         return self.call("/v1/product/import/prices", {"prices": [item]})
 
+    def set_auto_add_to_actions(self, offer_ids, enabled=False):
+        """Change only the Ozon auto-add flag; product prices are not included."""
+        responses = []
+        offer_ids = [str(value).strip() for value in offer_ids if str(value).strip()]
+        for i in range(0, len(offer_ids), 1000):
+            prices = [{
+                "offer_id": offer_id,
+                "auto_add_to_ozon_actions_list_enabled": bool(enabled),
+            } for offer_id in offer_ids[i:i + 1000]]
+            responses.append(self.call("/v1/product/import/prices", {"prices": prices}))
+        return responses
+
     def postings(self, scheme, since, to):
         if scheme == "FBS":
             return self.call("/v3/posting/fbs/list", {"dir":"ASC", "filter":{"since":since,"to":to}, "limit":1000, "offset":0, "with":{"analytics_data":True,"financial_data":True}}).get("result", {}).get("postings", [])
@@ -542,18 +575,22 @@ def sync_products():
                 buyer_price = seller_price
             old = number(p.get("old_price") or x.get("old_price"))
             ozon_min = number(p.get("min_price") or x.get("min_price"))
+            auto_add = optional_bool(p.get("auto_add_to_ozon_actions_list_enabled"))
+            auto_add_db = -1 if auto_add is None else int(auto_add)
             c.execute("""INSERT INTO products(
                 product_id,offer_id,name,sku,price,old_price,stock,updated_at,
-                seller_price,buyer_price,ozon_min_price
-              ) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET
+                seller_price,buyer_price,ozon_min_price,auto_add_to_actions,auto_add_checked_at
+              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET
               offer_id=excluded.offer_id,name=excluded.name,sku=excluded.sku,price=excluded.price,
               old_price=excluded.old_price,stock=excluded.stock,updated_at=excluded.updated_at,
               seller_price=excluded.seller_price,buyer_price=excluded.buyer_price,
-              ozon_min_price=excluded.ozon_min_price""",
+              ozon_min_price=excluded.ozon_min_price,
+              auto_add_to_actions=excluded.auto_add_to_actions,
+              auto_add_checked_at=excluded.auto_add_checked_at""",
               (pid, x.get("offer_id") or d.get("offer_id") or b.get("offer_id", ""),
                d.get("name") or x.get("name") or b.get("name") or f"Товар {pid}",
                d.get("sku") or x.get("sku", 0), seller_price, old, stock_map.get(pid, 0), now,
-               seller_price, buyer_price, ozon_min))
+               seller_price, buyer_price, ozon_min, auto_add_db, now))
             if pid in image_map:
                 c.execute("UPDATE products SET image_url=? WHERE product_id=?",
                           (image_map[pid], pid))
@@ -562,6 +599,51 @@ def sync_products():
     notify(f"OZON Assistant: синхронизировано товаров — {len(prices)}")
     notify_profit_risks()
     return len(prices)
+
+
+def promotion_auto_add_snapshot():
+    """Read the current auto-add switch for all products directly from Ozon."""
+    api = Ozon()
+    listing = api.product_ids()
+    product_ids = [int(item.get("product_id")) for item in listing if item.get("product_id")]
+    prices = api.prices(product_ids) if product_ids else []
+    with db() as c:
+        local = {int(row["product_id"]): dict(row) for row in c.execute(
+            "SELECT product_id,offer_id,name,sku,image_url FROM products"
+        )}
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    items = []
+    for row in prices:
+        product_id = int(row.get("product_id") or 0)
+        price = row.get("price") or {}
+        enabled = optional_bool(price.get("auto_add_to_ozon_actions_list_enabled"))
+        cached = local.get(product_id, {})
+        items.append({
+            "product_id": product_id,
+            "offer_id": str(row.get("offer_id") or cached.get("offer_id") or ""),
+            "sku": row.get("sku") or cached.get("sku") or 0,
+            "name": row.get("name") or cached.get("name") or f"Товар {product_id}",
+            "image_url": cached.get("image_url") or "",
+            "enabled": enabled,
+        })
+    with db() as c:
+        for item in items:
+            value = -1 if item["enabled"] is None else int(item["enabled"])
+            c.execute(
+                "UPDATE products SET auto_add_to_actions=?,auto_add_checked_at=? WHERE product_id=?",
+                (value, checked_at, item["product_id"]),
+            )
+    items.sort(key=lambda item: (item["enabled"] is not True, item["offer_id"].casefold()))
+    return {
+        "checked_at": checked_at,
+        "items": items,
+        "summary": {
+            "total": len(items),
+            "enabled": sum(item["enabled"] is True for item in items),
+            "disabled": sum(item["enabled"] is False for item in items),
+            "unknown": sum(item["enabled"] is None for item in items),
+        },
+    }
 
 
 def notify_profit_risks():
@@ -956,6 +1038,71 @@ def profit_protection_settings():
                    message=f"Целевая маржа {margin:g}% сохранена локально")
 
 
+@app.get("/api/promotions/auto-add/preview")
+def promotions_auto_add_preview():
+    try:
+        snapshot = promotion_auto_add_snapshot()
+        return jsonify(ok=True, **snapshot)
+    except Exception as e:
+        log(f"Проверка автодобавления в акции: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.post("/api/promotions/auto-add/disable")
+def promotions_auto_add_disable():
+    payload = request.json or {}
+    if payload.get("confirmed") is not True:
+        return jsonify(ok=False, message="Нужно подтвердить отключение автодобавления"), 400
+    try:
+        before = promotion_auto_add_snapshot()
+        offer_ids = [item["offer_id"] for item in before["items"] if item["enabled"] is True]
+        if not offer_ids:
+            return jsonify(ok=True, changed=0, failed=0, remaining_enabled=0,
+                           message="Автодобавление уже отключено у всех проверенных товаров")
+        responses = Ozon().set_auto_add_to_actions(offer_ids, enabled=False)
+        changed, errors = 0, []
+        for response in responses:
+            results = response.get("result", response.get("items", []))
+            if isinstance(results, dict):
+                results = results.get("items", [])
+            for item in results if isinstance(results, list) else []:
+                item_errors = item.get("errors") or []
+                if item.get("updated") is True and not item_errors:
+                    changed += 1
+                else:
+                    errors.append({
+                        "offer_id": str(item.get("offer_id") or ""),
+                        "message": "; ".join(str(error.get("message") or error.get("code") or error)
+                                              for error in item_errors) or "Ozon не подтвердил изменение",
+                    })
+        after = promotion_auto_add_snapshot()
+        remaining = after["summary"]["enabled"]
+        if changed == 0 and not errors and remaining == 0:
+            changed = len(offer_ids)
+        failed = len(errors)
+        verification_pending = remaining > 0 and changed > 0 and not errors
+        log(f"Автодобавление в акции отключено: {changed}; осталось включено: {remaining}")
+        return jsonify(
+            ok=not errors,
+            changed=changed,
+            failed=failed,
+            remaining_enabled=remaining,
+            verification_pending=verification_pending,
+            errors=errors[:50],
+            items=after["items"],
+            summary=after["summary"],
+            checked_at=after["checked_at"],
+            message=(f"Автодобавление отключено. Подтверждено товаров: {changed}."
+                     if remaining == 0 else
+                     f"Ozon принял изменение для {changed} товаров. Статус ещё обновляется; повторите проверку через несколько минут."
+                     if verification_pending else
+                     f"Не удалось изменить {len(errors)} товаров. Автодобавление осталось включено у {remaining}."),
+        )
+    except Exception as e:
+        log(f"Отключение автодобавления в акции: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
 @app.post("/api/test")
 def test_connection():
     try:
@@ -1253,3 +1400,4 @@ if __name__ == "__main__":
     init_db()
     apply_cost_rules(force=False)
     serve(app, host="127.0.0.1", port=8765, threads=8)
+
