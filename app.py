@@ -20,7 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ozon_assistant.db"
 SERVICE = "OzonAssistant"
 OZON_URL = "https://api-seller.ozon.ru"
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/update.json"
 TT_OPTIMIZATION_PATH = APP_DIR / "tt_optimization.json"
 TT_OPTIMIZATION_URL = "https://raw.githubusercontent.com/tacticatrus-spec/ozon-pomoshchnik/main/tt_optimization.json"
@@ -380,14 +380,18 @@ class Ozon:
         self.client_id = secret("client_id")
         self.api_key = secret("api_key")
 
-    def call(self, path, body=None):
+    def call(self, path, body=None, method="POST"):
         if not self.client_id or not self.api_key:
             raise OzonError("Сначала сохраните Client ID и API Key")
         try:
-            r = requests.post(OZON_URL + path, json=body or {}, headers={
+            headers = {
                 "Client-Id": self.client_id, "Api-Key": self.api_key,
                 "Content-Type": "application/json"
-            }, timeout=35)
+            }
+            if method == "GET":
+                r = requests.get(OZON_URL + path, headers=headers, timeout=35)
+            else:
+                r = requests.post(OZON_URL + path, json=body or {}, headers=headers, timeout=35)
         except requests.RequestException as e:
             raise OzonError(f"Ошибка соединения с Ozon: {e}") from e
         if not r.ok:
@@ -480,6 +484,76 @@ class Ozon:
             } for offer_id in offer_ids[i:i + 100]]
             responses.append(self.call("/v1/product/import/prices", {"prices": prices}))
         return responses
+
+    def actions(self):
+        """Return promotions available to the seller."""
+        data = self.call("/v1/actions", method="GET")
+        result = data.get("result", data)
+        return result if isinstance(result, list) else []
+
+    def action_products(self, action_id):
+        """Return every current member of an action using the post-cutover v2 API."""
+        products, last_id, seen = [], "", set()
+        for _ in range(100):
+            data = self.call("/v2/actions/products", {
+                "action_id": int(action_id), "limit": 100, "last_id": last_id,
+            })
+            result = data.get("result", data)
+            page = result.get("products", []) if isinstance(result, dict) else []
+            if not isinstance(page, list):
+                raise OzonError("Ozon вернул некорректный список товаров в акции")
+            products.extend(page)
+            next_id = result.get("last_id", "") if isinstance(result, dict) else ""
+            if not page or not next_id:
+                return products
+            next_id = str(next_id)
+            if next_id in seen:
+                raise OzonError("Ozon повторил курсор списка товаров в акции")
+            seen.add(next_id)
+            last_id = next_id
+        raise OzonError("Список товаров в акции превысил безопасный предел страниц")
+
+    def scheduled_action_products(self, action_id, auto_add_date):
+        """Return products scheduled for automatic participation."""
+        products, offset = [], 0
+        for _ in range(100):
+            data = self.call("/v2/actions/auto-add/products/list", {
+                "action_id": int(action_id), "auto_add_date": auto_add_date,
+                "limit": 100, "offset": offset,
+            })
+            page = data.get("products", data.get("result", {}).get("products", []))
+            if not isinstance(page, list):
+                raise OzonError("Ozon вернул некорректный список будущих товаров акции")
+            products.extend(page)
+            total = int(data.get("total", data.get("result", {}).get("total", len(products))) or 0)
+            if not page or len(products) >= total or len(page) < 100:
+                return products
+            offset += len(page)
+        raise OzonError("Список будущих товаров акции превысил безопасный предел страниц")
+
+    def deactivate_action_products(self, action_id, product_ids):
+        return self.call("/v2/actions/products/deactivate", {
+            "action_id": int(action_id),
+            "product_ids": [int(value) for value in product_ids],
+        })
+
+    def update_action_price_limits(self, action_id, products):
+        payload = []
+        for product in products:
+            amount = float(product["exit_price"])
+            payload.append({
+                "product_id": int(product["product_id"]),
+                "action_price": {"amount": f"{amount:.2f}", "currency": "RUB"},
+            })
+        return self.call("/v1/actions/products/update", {
+            "action_id": int(action_id), "products": payload,
+        })
+
+    def delete_scheduled_action_products(self, action_id, auto_add_date, product_ids):
+        return self.call("/v2/actions/auto-add/products/delete", {
+            "action_id": int(action_id), "auto_add_date": auto_add_date,
+            "product_ids": [int(value) for value in product_ids],
+        })
 
     def postings(self, scheme, since, to):
         if scheme == "FBS":
@@ -645,6 +719,59 @@ def promotion_auto_add_snapshot():
             "unknown": sum(item["enabled"] is None for item in items),
         },
     }
+
+
+def promotion_money(value):
+    """Read the Money shape used by the promotions v2 API."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        currency = str(value.get("currency") or value.get("currency_code") or "RUB")
+        if currency and currency != "RUB":
+            raise OzonError(f"Неожиданная валюта акции: {currency}")
+        value = value.get("amount", value.get("value"))
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
+
+
+def promotion_local_products():
+    with db() as c:
+        return {int(row["product_id"]): dict(row) for row in c.execute(
+            "SELECT product_id,offer_id,name,sku,image_url FROM products"
+        )}
+
+
+def promotion_product_view(raw, local=None):
+    local = local or {}
+    product_id = int(raw.get("id") or raw.get("product_id") or 0)
+    cached = local.get(product_id, {})
+    required = promotion_money(raw.get("max_action_price"))
+    action_price = promotion_money(raw.get("action_price"))
+    price = promotion_money(raw.get("price"))
+    return {
+        "product_id": product_id,
+        "offer_id": str(raw.get("offer_id") or cached.get("offer_id") or ""),
+        "sku": raw.get("sku") or cached.get("sku") or 0,
+        "name": raw.get("name") or cached.get("name") or f"Товар {product_id}",
+        "image_url": cached.get("image_url") or product_image(raw),
+        "action_price": action_price,
+        "required_price": required,
+        "price": price,
+        "stock": int(raw.get("stock") or 0),
+        "add_mode": str(raw.get("add_mode") or ""),
+        "exit_price": round(required + 1, 2) if required is not None else None,
+    }
+
+
+def find_action(api, action_id):
+    action_id = int(action_id)
+    for action in api.actions():
+        if int(action.get("id") or 0) == action_id:
+            return action
+    raise OzonError("Акция не найдена или уже завершена")
 
 
 def notify_profit_risks():
@@ -1101,6 +1228,179 @@ def promotions_auto_add_disable():
         )
     except Exception as e:
         log(f"Отключение автодобавления в акции: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.get("/api/promotions/actions")
+def promotions_actions():
+    try:
+        actions = []
+        for raw in Ozon().actions():
+            count = int(raw.get("participating_products_count") or 0)
+            auto_dates = raw.get("auto_add_dates") or []
+            if not (raw.get("is_participating") or count or auto_dates):
+                continue
+            actions.append({
+                "id": int(raw.get("id") or 0),
+                "title": str(raw.get("title") or "Без названия"),
+                "action_type": str(raw.get("action_type") or ""),
+                "is_voucher_action": raw.get("is_voucher_action") is True,
+                "date_start": str(raw.get("date_start") or ""),
+                "date_end": str(raw.get("date_end") or ""),
+                "freeze_date": str(raw.get("freeze_date") or ""),
+                "participating_products_count": count,
+                "auto_add_dates": [str(value) for value in auto_dates],
+            })
+        actions.sort(key=lambda item: (item["participating_products_count"] == 0,
+                                       item["date_end"], item["title"]))
+        return jsonify(ok=True, actions=actions)
+    except Exception as e:
+        log(f"Получение списка акций: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.get("/api/promotions/actions/<int:action_id>/products")
+def promotions_action_products(action_id):
+    try:
+        api = Ozon()
+        action = find_action(api, action_id)
+        products = [promotion_product_view(item, promotion_local_products())
+                    for item in api.action_products(action_id)]
+        products.sort(key=lambda item: (item["offer_id"].casefold(), item["product_id"]))
+        return jsonify(
+            ok=True,
+            action={
+                "id": action_id,
+                "title": str(action.get("title") or "Без названия"),
+                "action_type": str(action.get("action_type") or ""),
+                "is_voucher_action": action.get("is_voucher_action") is True,
+                "freeze_date": str(action.get("freeze_date") or ""),
+            },
+            products=products,
+        )
+    except Exception as e:
+        log(f"Товары акции {action_id}: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.get("/api/promotions/actions/<int:action_id>/scheduled")
+def promotions_scheduled_products(action_id):
+    auto_add_date = request.args.get("date", "").strip()
+    try:
+        api = Ozon()
+        action = find_action(api, action_id)
+        valid_dates = [str(value) for value in action.get("auto_add_dates") or []]
+        if auto_add_date not in valid_dates:
+            return jsonify(ok=False, message="Дата автодобавления больше не актуальна"), 400
+        products = [promotion_product_view(item, promotion_local_products())
+                    for item in api.scheduled_action_products(action_id, auto_add_date)]
+        products.sort(key=lambda item: (item["offer_id"].casefold(), item["product_id"]))
+        return jsonify(ok=True, action_id=action_id, auto_add_date=auto_add_date,
+                       products=products)
+    except Exception as e:
+        log(f"Будущие товары акции {action_id}: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.post("/api/promotions/actions/<int:action_id>/remove")
+def promotions_remove_products(action_id):
+    payload = request.json or {}
+    if payload.get("confirmed") is not True:
+        return jsonify(ok=False, message="Нужно подтвердить исключение товаров из акции"), 400
+    requested = payload.get("products") or []
+    if not isinstance(requested, list) or not requested or len(requested) > 1000:
+        return jsonify(ok=False, message="Выберите от 1 до 1000 товаров"), 400
+    try:
+        api = Ozon()
+        action = find_action(api, action_id)
+        live = {item["product_id"]: item for item in (
+            promotion_product_view(raw) for raw in api.action_products(action_id)
+        )}
+        product_ids = []
+        for item in requested:
+            product_id = int(item.get("product_id") or 0)
+            if product_id <= 0 or product_id not in live or product_id in product_ids:
+                raise ValueError("Список товаров изменился. Обновите акцию и выберите товары заново")
+            product_ids.append(product_id)
+
+        voucher = action.get("is_voucher_action") is True or str(action.get("action_type")) == "VOUCHER"
+        if voucher:
+            response = api.deactivate_action_products(action_id, product_ids)
+            result = response.get("result", response) if isinstance(response, dict) else response
+            confirmed = result.get("product_ids", []) if isinstance(result, dict) else []
+            confirmed = {str(value) for value in confirmed}
+            removed = [value for value in product_ids if str(value) in confirmed]
+            failed = [value for value in product_ids if str(value) not in confirmed]
+        else:
+            updates = []
+            for item in requested:
+                product_id = int(item["product_id"])
+                required = live[product_id].get("required_price")
+                try:
+                    exit_price = float(item.get("exit_price"))
+                except (TypeError, ValueError):
+                    raise ValueError(f"Укажите предельную цену выхода для товара {product_id}")
+                if required is None:
+                    raise ValueError(
+                        f"Ozon не вернул требуемую цену для товара {product_id}; ничего не отправлено"
+                    )
+                if exit_price <= required:
+                    raise ValueError(
+                        f"Для товара {product_id} цена выхода должна быть выше {required:.2f} ₽"
+                    )
+                updates.append({"product_id": product_id, "exit_price": exit_price})
+            response = api.update_action_price_limits(action_id, updates)
+            result = response.get("result", response) if isinstance(response, dict) else {}
+            confirmed = {str(value) for value in result.get("deactivated_product_ids", [])}
+            rejected_ids = {str(item.get("product_id") or item.get("id"))
+                            for item in result.get("rejected", []) if isinstance(item, dict)}
+            removed = [value for value in product_ids if str(value) in confirmed]
+            failed = [value for value in product_ids
+                      if str(value) not in confirmed or str(value) in rejected_ids]
+
+        log(f"Исключение из акции {action_id}: подтверждено {len(removed)}, ошибок {len(failed)}")
+        return jsonify(
+            ok=not failed,
+            removed=removed,
+            failed=failed,
+            message=(f"Ozon подтвердил исключение товаров: {len(removed)}."
+                     if not failed else
+                     f"Ozon подтвердил исключение {len(removed)} из {len(product_ids)} товаров. "
+                     "Обновите список перед повторной попыткой."),
+        ), (200 if not failed else 409)
+    except Exception as e:
+        log(f"Исключение товаров из акции {action_id}: {e}", "error")
+        return jsonify(ok=False, message=str(e)), 400
+
+
+@app.post("/api/promotions/actions/<int:action_id>/scheduled/remove")
+def promotions_remove_scheduled_products(action_id):
+    payload = request.json or {}
+    if payload.get("confirmed") is not True:
+        return jsonify(ok=False, message="Нужно подтвердить удаление из будущей акции"), 400
+    auto_add_date = str(payload.get("auto_add_date") or "").strip()
+    try:
+        product_ids = list(dict.fromkeys(int(value) for value in payload.get("product_ids") or []))
+    except (TypeError, ValueError):
+        product_ids = []
+    if not product_ids or len(product_ids) > 1000:
+        return jsonify(ok=False, message="Выберите от 1 до 1000 товаров"), 400
+    try:
+        api = Ozon()
+        action = find_action(api, action_id)
+        if auto_add_date not in [str(value) for value in action.get("auto_add_dates") or []]:
+            return jsonify(ok=False, message="Дата автодобавления больше не актуальна"), 400
+        response = api.delete_scheduled_action_products(action_id, auto_add_date, product_ids)
+        result = response.get("result", response) if isinstance(response, dict) else response
+        confirmed = result.get("product_ids", []) if isinstance(result, dict) else []
+        confirmed = {str(value) for value in confirmed}
+        removed = [value for value in product_ids if str(value) in confirmed]
+        failed = [value for value in product_ids if str(value) not in confirmed]
+        log(f"Удалено из будущей акции {action_id}: {len(removed)}")
+        return jsonify(ok=not failed, removed=removed, failed=failed,
+                       message=f"Удалено из будущего автодобавления: {len(removed)}"), (200 if not failed else 409)
+    except Exception as e:
+        log(f"Удаление из будущей акции {action_id}: {e}", "error")
         return jsonify(ok=False, message=str(e)), 400
 
 
