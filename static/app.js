@@ -34,6 +34,62 @@ async function disableAutoAdd(){
  if(!count||!confirm(`Отключить автоматическое добавление в акции у ${count} товаров?\n\nЦены не изменятся. Из уже действующих акций товары автоматически не удалятся.`))return;
  try{$('disableAutoAdd').disabled=true;$('promoAutoAddResults').insertAdjacentHTML('afterbegin','<p class="hint">Выключаю автодобавление и проверяю результат…</p>');let x=await api('/api/promotions/auto-add/disable',{method:'POST',body:JSON.stringify({confirmed:true})});renderAutoAdd(x);toast(x.message,Number(x.failed||0)>0)}catch(e){$('disableAutoAdd').disabled=false;$('promoAutoAddResults').insertAdjacentHTML('afterbegin',`<div class="persistent-error"><b>Ozon не принял отключение</b><p>${esc(e.message)}</p><small>Текст ошибки сохранён на экране. Цены не изменялись.</small></div>`);toast(e.message,true)}
 }
+let promotionActions=[],promotionProducts=[],scheduledPromotionProducts=[];
+async function loadPromotions(){
+ try{
+  $('promotionStatus').innerHTML='<p class="hint">Получаю список акций из Ozon…</p>';
+  let x=await api('/api/promotions/actions');promotionActions=x.actions||[];
+  $('promotionSelect').innerHTML='<option value="">Выберите акцию</option>'+promotionActions.map(a=>`<option value="${a.id}">${esc(a.title)} · товаров ${a.participating_products_count}</option>`).join('');
+  $('promotionStatus').innerHTML=promotionActions.length?`<p class="good">Найдено акций: ${promotionActions.length}. Выберите нужную.</p>`:'<p class="hint">Активных или запланированных акций не найдено.</p>';
+  $('activePromotionPanel').style.display='none';$('scheduledPromotionPanel').style.display='none';
+ }catch(e){$('promotionStatus').innerHTML=`<div class="persistent-error"><b>Список акций не получен</b><p>${esc(e.message)}</p></div>`;toast(e.message,true)}
+}
+async function loadPromotionProducts(){
+ const id=Number($('promotionSelect').value||0);if(!id){$('activePromotionPanel').style.display='none';$('scheduledPromotionPanel').style.display='none';return}
+ const selected=promotionActions.find(a=>a.id===id)||{};
+ try{
+  $('activePromotionPanel').style.display='block';$('activePromotionTitle').textContent=selected.title||'Текущая акция';$('activePromotionMeta').textContent='Загружаю товары…';$('activePromotionProducts').innerHTML='';$('promotionError').innerHTML='';
+  let x=await api(`/api/promotions/actions/${id}/products`);promotionProducts=x.products||[];
+  $('activePromotionMeta').textContent=`${x.action.is_voucher_action?'Промокод — прямое исключение':'Обычная акция — выход через предельную цену'} · товаров ${promotionProducts.length}${x.action.freeze_date?' · заморозка '+x.action.freeze_date:''}`;
+  renderPromotionProducts(x.action);
+  let dates=selected.auto_add_dates||[];$('scheduledPromotionPanel').style.display=dates.length?'block':'none';
+  if(dates.length){$('scheduledPromotionDate').innerHTML=dates.map(d=>`<option value="${esc(d)}">${esc(d)}</option>`).join('');await loadScheduledPromotionProducts()}
+ }catch(e){promotionProducts=[];$('activePromotionProducts').innerHTML=`<div class="persistent-error"><b>Товары не получены</b><p>${esc(e.message)}</p></div>`;toast(e.message,true)}
+}
+function renderPromotionProducts(action){
+ if(!promotionProducts.length){$('activePromotionProducts').innerHTML='<p class="good">В этой акции сейчас нет ваших товаров.</p>';return}
+ const voucher=action.is_voucher_action;
+ let rows=promotionProducts.map((p,i)=>`<tr><td><input class="promotion-product" type="checkbox" data-index="${i}"></td><td><div class="product-card">${productPhoto(p)}<div><b>${esc(p.name)}</b><br><small>${esc(p.offer_id)} · ID ${p.product_id}</small></div></div></td><td>${p.action_price==null?'—':money(p.action_price)}</td><td>${p.required_price==null?'—':money(p.required_price)}</td><td>${voucher?'<span class="pill">Прямое исключение</span>':p.exit_price==null?'<span class="bad">Ozon не вернул лимит</span>':`<input class="promotion-exit-price" data-index="${i}" type="number" min="0.01" step="0.01" value="${p.exit_price}"><small class="hint"> ₽</small>`}</td></tr>`).join('');
+ $('activePromotionProducts').innerHTML=`<div class="tablewrap"><table><thead><tr><th></th><th>Товар</th><th>Цена в акции</th><th>Требуемая цена</th><th>${voucher?'Способ':'Предельная цена выхода'}</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">Предельная цена применяется только к участию в выбранной акции. Себестоимость и обычная цена товара не отправляются.</p>`;
+}
+function togglePromotionProducts(checked){document.querySelectorAll('.promotion-product').forEach(x=>x.checked=checked)}
+async function removePromotionProducts(){
+ const id=Number($('promotionSelect').value||0),action=promotionActions.find(a=>a.id===id)||{};
+ let selected=[...document.querySelectorAll('.promotion-product:checked')].map(x=>{let i=Number(x.dataset.index),p=promotionProducts[i],price=document.querySelector(`.promotion-exit-price[data-index="${i}"]`);return {product_id:p.product_id,exit_price:price?price.value:null}});
+ if(!selected.length){toast('Выберите товары',true);return}
+ let detail=action.is_voucher_action?'Ozon получит команду прямого исключения.':'Для выбранных товаров Ozon получит показанную предельную цену выхода. Обычная цена и себестоимость не отправляются.';
+ if(!confirm(`Исключить из акции «${action.title||id}» товаров: ${selected.length}?\n\n${detail}`))return;
+ try{
+  $('removePromotionProducts').disabled=true;$('promotionError').innerHTML='<p class="hint">Отправляю запрос и жду подтверждение Ozon…</p>';
+  let x=await api(`/api/promotions/actions/${id}/remove`,{method:'POST',body:JSON.stringify({confirmed:true,products:selected})});toast(x.message);$('promotionError').innerHTML=`<p class="good">${esc(x.message)}</p>`;await loadPromotionProducts();
+ }catch(e){$('promotionError').innerHTML=`<div class="persistent-error"><b>Ozon не подтвердил исключение</b><p>${esc(e.message)}</p><small>Ошибка сохранена на экране. Обновите список перед повторной попыткой.</small></div>`;toast(e.message,true)}finally{$('removePromotionProducts').disabled=false}
+}
+async function loadScheduledPromotionProducts(){
+ const id=Number($('promotionSelect').value||0),date=$('scheduledPromotionDate').value;if(!id||!date)return;
+ try{
+  $('scheduledPromotionProducts').innerHTML='<p class="hint">Получаю запланированные товары…</p>';
+  let x=await api(`/api/promotions/actions/${id}/scheduled?date=${encodeURIComponent(date)}`);scheduledPromotionProducts=x.products||[];
+  $('scheduledPromotionProducts').innerHTML=scheduledPromotionProducts.length?`<div class="tablewrap"><table><thead><tr><th></th><th>Товар</th><th>Запланированная цена</th></tr></thead><tbody>${scheduledPromotionProducts.map((p,i)=>`<tr><td><input class="scheduled-product" type="checkbox" data-index="${i}"></td><td><div class="product-card">${productPhoto(p)}<div><b>${esc(p.name)}</b><br><small>${esc(p.offer_id)} · ID ${p.product_id}</small></div></div></td><td>${p.action_price==null?'—':money(p.action_price)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="good">На эту дату автодобавление товаров не запланировано.</p>';
+ }catch(e){scheduledPromotionProducts=[];$('scheduledPromotionProducts').innerHTML=`<div class="persistent-error"><b>Будущие товары не получены</b><p>${esc(e.message)}</p></div>`;toast(e.message,true)}
+}
+function toggleScheduledProducts(checked){document.querySelectorAll('.scheduled-product').forEach(x=>x.checked=checked)}
+async function removeScheduledPromotionProducts(){
+ const id=Number($('promotionSelect').value||0),date=$('scheduledPromotionDate').value;
+ let ids=[...document.querySelectorAll('.scheduled-product:checked')].map(x=>scheduledPromotionProducts[Number(x.dataset.index)].product_id);
+ if(!ids.length){toast('Выберите товары',true);return}
+ if(!confirm(`Удалить ${ids.length} товаров из автодобавления на ${date}?`))return;
+ try{let x=await api(`/api/promotions/actions/${id}/scheduled/remove`,{method:'POST',body:JSON.stringify({confirmed:true,auto_add_date:date,product_ids:ids})});toast(x.message);await loadScheduledPromotionProducts()}catch(e){$('scheduledPromotionProducts').insertAdjacentHTML('afterbegin',`<div class="persistent-error"><b>Ozon не подтвердил удаление</b><p>${esc(e.message)}</p></div>`);toast(e.message,true)}
+}
 async function syncAll(){try{toast('Синхронизация началась…');let x=await api('/api/sync',{method:'POST'});toast(x.message);await load()}catch(e){toast(e.message,true)}}
 async function demo(){await api('/api/demo',{method:'POST'});toast('Демо-данные загружены');load()}
 async function exportCards(){
