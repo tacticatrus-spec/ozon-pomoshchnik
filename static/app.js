@@ -1,6 +1,6 @@
 let data={};const $=x=>document.getElementById(x);function money(x){return Number(x||0).toLocaleString('ru-RU',{maximumFractionDigits:2})+' ₽'}
-function toast(s,bad=false){let x=$('toast');x.textContent=s;x.style.background=bad?'#b82740':'#172033';x.style.display='block';setTimeout(()=>x.style.display='none',4500)}
-async function api(url,opt={}){opt.headers={'Content-Type':'application/json'};let r=await fetch(url,opt),j=await r.json();if(!r.ok)throw Error(j.message||'Ошибка');return j}
+function toast(s,bad=false){let x=$('toast');x.textContent=s;x.style.background=bad?'#b82740':'#172033';x.style.display='block';setTimeout(()=>x.style.display='none',bad?10000:4500)}
+async function api(url,opt={}){opt.headers={'Content-Type':'application/json'};let r=await fetch(url,opt),raw=await r.text(),j={};try{j=raw?JSON.parse(raw):{}}catch(_){j={message:raw||`Ошибка сервера ${r.status}`}}if(!r.ok)throw Error(j.message||`Ошибка ${r.status}`);return j}
 async function load(){data=await api('/api/dashboard');let r=data.risk_summary||{};$('nProducts').textContent=data.products.length;$('nStock').textContent=data.products.reduce((a,x)=>a+x.stock,0);$('nOrders').textContent=data.order_count;$('nRisks').textContent=(r.loss||0)+(r.below_margin||0);$('riskCaption').textContent=(r.loss||0)+' в убытке, '+(r.below_margin||0)+' ниже маржи';$('appVersion').textContent='Версия '+data.version;render()}
 function render(){
  $('events').innerHTML=data.events.map(x=>`<div class="event"><small>${x.created_at}</small><div>${esc(x.message)}</div></div>`).join('')||'<p class="hint">Пока событий нет</p>';
@@ -27,12 +27,12 @@ function renderAutoAdd(snapshot){
  $('promoAutoAddResults').innerHTML=rows?`<p><b>Требуют внимания: ${enabled.length+unknown.length}</b></p><div class="tablewrap"><table class="promo-table"><thead><tr><th>Товар</th><th>Автодобавление</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">Проверено: ${esc(snapshot.checked_at||'только что')}. Товары со статусом «Не определено» программа не изменяет.</p>`:'<p class="good">Автодобавление отключено у всех проверенных товаров.</p>';
 }
 async function previewAutoAdd(){
- try{$('promoAutoAddResults').innerHTML='<p class="hint">Проверяю настройки всех товаров напрямую в Ozon…</p>';$('disableAutoAdd').disabled=true;let x=await api('/api/promotions/auto-add/preview');renderAutoAdd(x);toast(x.summary.enabled?`Автодобавление включено у ${x.summary.enabled} товаров`:'Автодобавление уже отключено у всех товаров',x.summary.enabled>0)}catch(e){$('promoAutoAddResults').innerHTML='';toast(e.message,true)}
+ try{$('promoAutoAddResults').innerHTML='<p class="hint">Проверяю настройки всех товаров напрямую в Ozon…</p>';$('disableAutoAdd').disabled=true;let x=await api('/api/promotions/auto-add/preview');renderAutoAdd(x);toast(x.summary.enabled?`Автодобавление включено у ${x.summary.enabled} товаров`:'Автодобавление уже отключено у всех товаров',x.summary.enabled>0)}catch(e){$('promoAutoAddResults').innerHTML=`<div class="persistent-error"><b>Проверка не выполнена</b><p>${esc(e.message)}</p><small>Текст ошибки останется здесь — его можно сфотографировать или скопировать.</small></div>`;toast(e.message,true)}
 }
 async function disableAutoAdd(){
  const count=promoAutoAddItems.filter(item=>item.enabled===true).length;
  if(!count||!confirm(`Отключить автоматическое добавление в акции у ${count} товаров?\n\nЦены не изменятся. Из уже действующих акций товары автоматически не удалятся.`))return;
- try{$('disableAutoAdd').disabled=true;$('promoAutoAddResults').insertAdjacentHTML('afterbegin','<p class="hint">Отправляю настройку в Ozon и проверяю результат…</p>');let x=await api('/api/promotions/auto-add/disable',{method:'POST',body:JSON.stringify({confirmed:true})});renderAutoAdd(x);toast(x.message,Number(x.failed||0)>0)}catch(e){toast(e.message,true);await previewAutoAdd()}
+ try{$('disableAutoAdd').disabled=true;$('promoAutoAddResults').insertAdjacentHTML('afterbegin','<p class="hint">Выключаю автодобавление и проверяю результат…</p>');let x=await api('/api/promotions/auto-add/disable',{method:'POST',body:JSON.stringify({confirmed:true})});renderAutoAdd(x);toast(x.message,Number(x.failed||0)>0)}catch(e){$('disableAutoAdd').disabled=false;$('promoAutoAddResults').insertAdjacentHTML('afterbegin',`<div class="persistent-error"><b>Ozon не принял отключение</b><p>${esc(e.message)}</p><small>Текст ошибки сохранён на экране. Цены не изменялись.</small></div>`);toast(e.message,true)}
 }
 async function syncAll(){try{toast('Синхронизация началась…');let x=await api('/api/sync',{method:'POST'});toast(x.message);await load()}catch(e){toast(e.message,true)}}
 async function demo(){await api('/api/demo',{method:'POST'});toast('Демо-данные загружены');load()}
