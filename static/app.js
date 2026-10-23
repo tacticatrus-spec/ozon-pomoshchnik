@@ -17,6 +17,23 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.query
 async function saveSettings(){try{await api('/api/settings',{method:'POST',body:JSON.stringify({client_id:$('clientId').value,api_key:$('apiKey').value,telegram_token:$('tgToken').value,telegram_chat_id:$('chatId').value})});toast('Настройки сохранены');await load()}catch(e){toast(e.message,true)}}
 async function testOzon(){try{toast((await api('/api/test',{method:'POST'})).message)}catch(e){toast(e.message,true)}}
 async function findChat(){try{let x=await api('/api/telegram/chat');$('chatId').value=x.chat_id;toast('Telegram подключён')}catch(e){toast(e.message,true)}}
+let promoAutoAddItems=[];
+function renderAutoAdd(snapshot){
+ const summary=snapshot.summary||{};promoAutoAddItems=snapshot.items||[];
+ $('promoTotal').textContent=summary.total??0;$('promoEnabled').textContent=summary.enabled??0;$('promoDisabled').textContent=summary.disabled??0;$('promoUnknown').textContent=summary.unknown??0;
+ $('disableAutoAdd').disabled=!(summary.enabled>0);
+ const enabled=promoAutoAddItems.filter(item=>item.enabled===true),unknown=promoAutoAddItems.filter(item=>item.enabled==null);
+ let rows=enabled.concat(unknown).map(item=>`<tr><td><div class="product-card">${productPhoto(item)}<div><b>${esc(item.name)}</b><br><small>${esc(item.offer_id)}</small></div></div></td><td>${item.enabled===true?'<span class="status loss">Включено</span>':'<span class="status missing_cost">Не определено</span>'}</td></tr>`).join('');
+ $('promoAutoAddResults').innerHTML=rows?`<p><b>Требуют внимания: ${enabled.length+unknown.length}</b></p><div class="tablewrap"><table class="promo-table"><thead><tr><th>Товар</th><th>Автодобавление</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">Проверено: ${esc(snapshot.checked_at||'только что')}. Товары со статусом «Не определено» программа не изменяет.</p>`:'<p class="good">Автодобавление отключено у всех проверенных товаров.</p>';
+}
+async function previewAutoAdd(){
+ try{$('promoAutoAddResults').innerHTML='<p class="hint">Проверяю настройки всех товаров напрямую в Ozon…</p>';$('disableAutoAdd').disabled=true;let x=await api('/api/promotions/auto-add/preview');renderAutoAdd(x);toast(x.summary.enabled?`Автодобавление включено у ${x.summary.enabled} товаров`:'Автодобавление уже отключено у всех товаров',x.summary.enabled>0)}catch(e){$('promoAutoAddResults').innerHTML='';toast(e.message,true)}
+}
+async function disableAutoAdd(){
+ const count=promoAutoAddItems.filter(item=>item.enabled===true).length;
+ if(!count||!confirm(`Отключить автоматическое добавление в акции у ${count} товаров?\n\nЦены не изменятся. Из уже действующих акций товары автоматически не удалятся.`))return;
+ try{$('disableAutoAdd').disabled=true;$('promoAutoAddResults').insertAdjacentHTML('afterbegin','<p class="hint">Отправляю настройку в Ozon и проверяю результат…</p>');let x=await api('/api/promotions/auto-add/disable',{method:'POST',body:JSON.stringify({confirmed:true})});renderAutoAdd(x);toast(x.message,Number(x.failed||0)>0)}catch(e){toast(e.message,true);await previewAutoAdd()}
+}
 async function syncAll(){try{toast('Синхронизация началась…');let x=await api('/api/sync',{method:'POST'});toast(x.message);await load()}catch(e){toast(e.message,true)}}
 async function demo(){await api('/api/demo',{method:'POST'});toast('Демо-данные загружены');load()}
 async function exportCards(){
@@ -153,3 +170,4 @@ function productPhoto(p){
  if(!url.startsWith('https://'))return '<span class="product-photo empty">Нет фото</span>';
  return `<a class="product-photo" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Открыть фото крупнее"><img src="${esc(url)}" alt="${esc(p.name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.replaceWith(Object.assign(document.createElement('span'),{className:'product-photo empty',textContent:'Фото недоступно'}))"></a>`;
 }
+
